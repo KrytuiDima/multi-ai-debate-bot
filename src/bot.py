@@ -55,14 +55,20 @@ def get_main_menu_markup(user_id: int) -> InlineKeyboardMarkup:
 
     count_gemini = len(clients.get('Gemini').api_keys) if clients and 'Gemini' in clients else 0
     count_groq = len(clients.get('Llama3 (Groq)').api_keys) if clients and 'Llama3 (Groq)' in clients else 0
+    count_claude = len(clients.get('Claude').api_keys) if clients and 'Claude' in clients else 0
+    count_deepseek = len(clients.get('DeepSeek').api_keys) if clients and 'DeepSeek' in clients else 0
 
     status_gemini = "✅" if count_gemini > 0 else "❌"
     status_groq = "✅" if count_groq > 0 else "❌"
+    status_claude = "✅" if count_claude > 0 else "❌"
+    status_deepseek = "✅" if count_deepseek > 0 else "❌"
 
     # Кнопки для додавання/статусу ключів
     key_buttons = [
         InlineKeyboardButton(f"Додати API Groq {status_groq} ({count_groq})", callback_data='menu_key_Llama3 (Groq)'),
         InlineKeyboardButton(f"Додати API Gemini {status_gemini} ({count_gemini})", callback_data='menu_key_Gemini'),
+        InlineKeyboardButton(f"Додати API Claude {status_claude} ({count_claude})", callback_data='menu_key_Claude'),
+        InlineKeyboardButton(f"Додати API DeepSeek {status_deepseek} ({count_deepseek})", callback_data='menu_key_DeepSeek'),
     ]
     # Кнопка для перегляду профілю
     profile_button = InlineKeyboardButton("👤 Профіль", callback_data='menu_profile')
@@ -87,7 +93,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     
     # Використовуємо message.reply_text, оскільки це перша команда
     await update.message.reply_text(
-        "👋 **Головне меню.** Виберіть опцію нижче:",
+        "👋 <b>Головне меню.</b> Виберіть опцію нижче:",
         reply_markup=get_main_menu_markup(user_id),
         parse_mode="HTML"
     )
@@ -166,7 +172,7 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data['temp_model_name'] = model_name
         
         await query.edit_message_text(
-            f"Надішліть, будь ласка, Ваш API-ключ для **{model_name}**.",
+            f"Надішліть, будь ласка, Ваш API-ключ для <b>{model_name}</b>.",
             parse_mode="HTML"
         )
         return WAITING_API_KEY # Переходимо до FSM
@@ -178,7 +184,7 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
     elif data == 'menu_ask':
         # 2. Початок дебатів (Задання запитання)
-        await query.edit_message_text("✍️ Надішліть, будь ласка, **тему для дебатів** (текст запитання).")
+        await query.edit_message_text("✍️ Надішліть, будь ласка, <b>тему для дебатів</b> (текст запитання).", parse_mode="HTML")
         # Тут не використовуємо FSM, а чекаємо на наступне текстове повідомлення
         return ConversationHandler.END 
         
@@ -288,7 +294,7 @@ async def run_debate_round(session: DebateSession, chat_id: int, context: Contex
     
     # 3. Фінальне оновлення статусу
     await status_msg.edit_text(
-        f"✅ **РАУНД {session.round} ЗАВЕРШЕНО** ✅", 
+        f"✅ <b>РАУНД {session.round} ЗАВЕРШЕНО</b> ✅", 
         parse_mode="HTML"
     )
 
@@ -362,7 +368,7 @@ async def handle_debate_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     if query.data == 'debate_next_round':
         # Якщо сесія ще не завершена, запускаємо наступний раунд
-        await query.edit_message_text(f"Запускаємо **Раунд {session.round + 1}**...", parse_mode="HTML")
+        await query.edit_message_text(f"Запускаємо <b>Раунд {session.round + 1}</b>...", parse_mode="HTML")
         await run_debate_round(session, chat_id, context)
         
     elif query.data == 'debate_final_result':

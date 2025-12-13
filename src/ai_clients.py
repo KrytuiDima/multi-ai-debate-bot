@@ -2,6 +2,9 @@
 import abc
 from typing import Dict, List
 import asyncio
+import os
+import anthropic
+import httpx
 import google.generativeai as genai
 from groq import AsyncGroq, APIError as GroqAPIError
 
@@ -101,8 +104,110 @@ class GeminiClient(BaseAI):
             return f"Помилка генерації (Gemini Error): {e}"
 
 
+class ClaudeAI(BaseAI):
+    """Обгортка для моделі Anthropic Claude."""
+    def __init__(self, api_key: str):
+        super().__init__(api_key, "Claude")
+        self.client = anthropic.Anthropic(api_key=api_key)
+        self.model_name = "claude-3-haiku-20240307"
+
+    async def validate_key(self) -> bool:
+        """Перевірка ключа Claude."""
+        try:
+            # Спроба відправити простий запит
+            self.client.messages.create(
+                model=self.model_name,
+                max_tokens=10,
+                messages=[{"role": "user", "content": "ping"}]
+            )
+            return True
+        except Exception:
+            return False
+
+    async def generate_response(self, system_prompt: str, debate_history: str, topic: str) -> str:
+        """Генерація відповіді для Claude."""
+        user_content = (
+            f"Тема дебатів: {topic}\n"
+            f"Історія попередніх ходів:\n{debate_history}\n\n"
+            f"Завдання: Дотримуючись системних інструкцій, дай відповідь. Будь лаконічним та переконливим."
+        )
+        
+        try:
+            message = self.client.messages.create(
+                model=self.model_name,
+                max_tokens=2048,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_content}]
+            )
+            return message.content[0].text
+        except Exception as e:
+            return f"Помилка генерації (Claude Error): {e}"
+
+
+class DeepSeekAI(BaseAI):
+    """Обгортка для моделі DeepSeek."""
+    def __init__(self, api_key: str):
+        super().__init__(api_key, "DeepSeek")
+        self.api_key = api_key
+        self.url = "https://api.deepseek.com/chat/completions"
+        self.model_name = "deepseek-chat"
+
+    async def validate_key(self) -> bool:
+        """Перевірка ключа DeepSeek."""
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        data = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 10
+        }
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(self.url, headers=headers, json=data, timeout=10.0)
+                response.raise_for_status()
+                return True
+        except Exception:
+            return False
+
+    async def generate_response(self, system_prompt: str, debate_history: str, topic: str) -> str:
+        """Генерація відповіді для DeepSeek."""
+        user_content = (
+            f"Тема дебатів: {topic}\n"
+            f"Історія попередніх ходів:\n{debate_history}\n\n"
+            f"Завдання: Дотримуючись системних інструкцій, дай відповідь. Будь лаконічним та переконливим."
+        )
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        data = {
+            "model": self.model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ]
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(self.url, headers=headers, json=data, timeout=30.0)
+                response.raise_for_status()
+                response_json = response.json()
+                return response_json['choices'][0]['message']['content']
+        except httpx.HTTPStatusError as e:
+            return f"Помилка HTTP від DeepSeek: {e.response.text}"
+        except Exception as e:
+            return f"Помилка генерації (DeepSeek Error): {e}"
+
+
 # Словник для зручного вибору класів
 AI_CLIENTS: Dict[str, BaseAI] = {
     'Llama3 (Groq)': lambda api_key: GroqClient(api_key, 'Llama3 (Groq)'),
     'Gemini': lambda api_key: GeminiClient(api_key, 'Gemini'),
+    'Claude': lambda api_key: ClaudeAI(api_key),
+    'DeepSeek': lambda api_key: DeepSeekAI(api_key),
 }
