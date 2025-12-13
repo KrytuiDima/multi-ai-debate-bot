@@ -27,6 +27,10 @@ from database import db_manager # <--- НОВИЙ ІМПОРТ
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
+# --- НОВІ ГЛОБАЛЬНІ ЗМІННІ ДЛЯ WEBHOOK ---
+APPLICATION = None # Тут буде зберігатися об'єкт Application після ініціалізації
+# --- КІНЕЦЬ НОВИХ ЗМІН ---
+
 # --- СТАНИ FSM ---
 # FSM використовується лише для ОДНОГО завдання: отримання API ключа
 WAITING_API_KEY = 1
@@ -401,14 +405,17 @@ async def handle_debate_callback(update: Update, context: ContextTypes.DEFAULT_T
 # III. Запуск
 # --------------------------
 
-def main() -> None:
-    """Головна функція програми."""
-    if not TELEGRAM_BOT_TOKEN:
-        print("ПОМИЛКА: Не знайдено TELEGRAM_BOT_TOKEN у .env")
-        return
-
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
+def main_bot_setup(token: str) -> Application:
+    """Налаштовує Telegram Application, але НЕ запускає polling."""
+    
+    global APPLICATION
+    
+    if APPLICATION is not None:
+        return APPLICATION
+    
+    # Ініціалізуємо Application з переданим токеном
+    APPLICATION = Application.builder().token(token).build()
+    
     # ConversationHandler для FSM (тільки для введення API ключа)
     conv_handler = ConversationHandler(
         entry_points=[
@@ -422,27 +429,23 @@ def main() -> None:
         },
         fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
     )
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("profile", show_profile))
-    application.add_handler(conv_handler)
+    
+    # Реєструємо всі обробники
+    APPLICATION.add_handler(CommandHandler("start", start))
+    APPLICATION.add_handler(CommandHandler("profile", show_profile))
+    APPLICATION.add_handler(conv_handler)
     
     # Хендлер для кнопок головного меню, які не ведуть у FSM
-    application.add_handler(CallbackQueryHandler(main_menu_callback, pattern='^menu_'))
+    APPLICATION.add_handler(CallbackQueryHandler(main_menu_callback, pattern='^menu_'))
     
     # Хендлер для кнопок управління дебатами
-    application.add_handler(CallbackQueryHandler(handle_debate_callback, pattern='^debate_'))
+    APPLICATION.add_handler(CallbackQueryHandler(handle_debate_callback, pattern='^debate_'))
     
     # Хендлер для тексту (запитання), коли не активний FSM
-    application.add_handler(MessageHandler(
+    APPLICATION.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, 
         handle_question, 
         block=False
-    )) 
-
-    print("Бот запущено...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
+    ))
+    
+    return APPLICATION
