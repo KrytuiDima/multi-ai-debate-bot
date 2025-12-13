@@ -843,12 +843,22 @@ def main_bot_setup(token: str) -> Application:
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробляє помилки без зупинки бота."""
-    print(f"Update {update} caused error {context.error}")
+    error = context.error
+    error_type = type(error).__name__
+    error_msg = str(error)
     
-    # Логуємо помилку
-    if hasattr(context.error, '__traceback__'):
+    # Подавляємо Conflict помилки - вони означають, що інша інстанція запущена
+    if "Conflict" in error_msg or "terminated by other getUpdates" in error_msg:
+        print(f"⚠️  Conflict detected: Another bot instance is running")
+        print(f"Деталі: {error_msg}")
+        # Не логуємо трасбек для Conflict - це нормальна ситуація при перезапуску
+        return
+    
+    # Логуємо інші помилки
+    print(f"Update {update} caused error {error_type}: {error_msg}")
+    if hasattr(error, '__traceback__'):
         import traceback
-        traceback.print_exception(type(context.error), context.error, context.error.__traceback__)
+        traceback.print_exception(type(error), error, error.__traceback__)
 
 
 def main() -> None:
