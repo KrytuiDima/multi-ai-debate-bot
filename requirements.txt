@@ -2,10 +2,7 @@ python-telegram-bot
 python-dotenv
 google-genai
 groq
-# --- ДОДАНО ДЛЯ WEBHOOKS/VERCEL ---
 fastapi
 uvicorn
-requests
-fastapi
-uvicorn
-requests
+requests 
+psycopg2-binary

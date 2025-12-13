@@ -1,112 +1,162 @@
 # src/database.py
-import sqlite3
-from typing import Dict, List, Optional, Tuple
+import psycopg2
+import os
+from typing import Tuple, List, Dict
+from dotenv import load_dotenv
+
+# Завантажуємо .env локально, хоча на Vercel це робить платформа
+load_dotenv()
 
 class DatabaseManager:
-    """Керує базою даних SQLite для зберігання ключів користувачів."""
+    def __init__(self):
+        # Отримуємо рядок підключення з Vercel/оточення
+        self.db_url = os.getenv("DATABASE_URL")
+        if not self.db_url:
+            print("WARNING: DATABASE_URL не знайдено. БД функціонуватиме тільки з точкою входу Vercel.")
     
-    def __init__(self, db_name='debate_bot.db'):
-        # Тимчасово не створюємо з'єднання відразу, щоб уникнути запису файлу при імпорті
-        self.db_name = db_name
-        self.conn = None
-        self.cursor = None
-        
-        # self._connect() # <--- ТИМЧАСОВО КОМЕНТУЄМО
-        # self._create_table() # <--- ТИМЧАСОВО КОМЕНТУЄМО
-        # self._create_profile_table() # <--- ТИМЧАСОВО КОМЕНТУЄМО
-        pass
+    def _connect(self):
+        """Встановлює з'єднання з PostgreSQL."""
+        if not self.db_url:
+            raise Exception("DATABASE_URL не встановлено.")
+        return psycopg2.connect(self.db_url)
 
-    def _ensure_connected(self):
-        """Ленива ініціалізація: з'єднується та створює таблиці при першому використанні."""
-        if self.conn is None:
-            self.conn = sqlite3.connect(self.db_name)
-            self.cursor = self.conn.cursor()
-            self._create_table()
-            self._create_profile_table()
+    def _create_tables(self):
+        """Створює необхідні таблиці (використовуємо синтаксис PostgreSQL)."""
+        conn = None
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+            
+            # Таблиця 1: API-ключі користувачів
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS api_keys (
+                    user_id BIGINT NOT NULL,
+                    ai_service TEXT NOT NULL,
+                    api_key TEXT NOT NULL,
+                    PRIMARY KEY (user_id, ai_service)
+                );
+            """)
 
-    def _create_table(self):
-        """Створює таблицю, якщо вона ще не існує."""
-        # user_id - унікальний ID користувача Telegram
-        # model_name - назва моделі (e.g., 'Gemini', 'Llama3 (Groq)')
-        # api_key - сам ключ
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS api_keys (
-                user_id INTEGER NOT NULL,
-                model_name TEXT NOT NULL,
-                api_key TEXT NOT NULL,
-                UNIQUE(user_id, model_name, api_key)
-            )
-        """)
-        self.conn.commit()
+            # Таблиця 2: Профілі користувачів та баланс
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    balance NUMERIC(10, 2) DEFAULT 0.00,
+                    join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
 
-    def _create_profile_table(self):
-        """Створює таблицю профілів користувачів (баланс, ім'я, дата)."""
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS user_profiles (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                balance REAL DEFAULT 0.0,
-                join_date TEXT
-            )
-        """)
-        self.conn.commit()
+            conn.commit()
+            print("Таблиці успішно створені/перевірені.")
+        except Exception as e:
+            print(f"Помилка створення таблиць: {e}")
+        finally:
+            if conn:
+                conn.close()
 
     def get_user_profile(self, user_id: int, username: str) -> Tuple[float, str]:
-        """Отримує баланс та дату приєднання; створює профіль, якщо його немає."""
-        self._ensure_connected()
-        self.cursor.execute("SELECT balance, join_date FROM user_profiles WHERE user_id = ?", (user_id,))
-        result = self.cursor.fetchone()
+        """Отримує профіль або створює новий."""
+        conn = None
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT balance, join_date FROM user_profiles WHERE user_id = %s", (user_id,))
+            result = cursor.fetchone()
+            
+            if result:
+                balance, join_date = result
+                return float(balance), str(join_date)
+            else:
+                cursor.execute("""
+                    INSERT INTO user_profiles (user_id, username)
+                    VALUES (%s, %s)
+                    RETURNING balance, join_date;
+                """, (user_id, username))
+                conn.commit()
+                balance, join_date = cursor.fetchone()
+                return float(balance), str(join_date)
+                
+        except Exception as e:
+            print(f"Помилка отримання/створення профілю: {e}")
+            return 0.0, "N/A"
+        finally:
+            if conn:
+                conn.close()
 
-        if result is None:
-            # Створюємо новий профіль
-            self.cursor.execute("""
-                INSERT INTO user_profiles (user_id, username, balance, join_date) 
-                VALUES (?, ?, 0.0, datetime('now'))
-            """, (user_id, username))
-            self.conn.commit()
-            return 0.0, "Сьогодні"
-
-        return result[0], result[1]
-
-    def update_balance(self, user_id: int, amount: float):
-        """Змінює баланс користувача (додає/віднімає значення)."""
-        self._ensure_connected()
-        self.cursor.execute("UPDATE user_profiles SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-        self.conn.commit()
+    def update_balance(self, user_id: int, amount: float) -> bool:
+        """Оновлює баланс користувача."""
+        conn = None
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE user_profiles SET balance = balance + %s WHERE user_id = %s
+            """, (amount, user_id))
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"Помилка оновлення балансу: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
 
     def add_key(self, user_id: int, model_name: str, api_key: str) -> bool:
-        """Додає новий ключ для користувача."""
-        self._ensure_connected()
+        """Додає новий API-ключ для користувача."""
+        conn = None
         try:
-            self.cursor.execute("""
-                INSERT OR IGNORE INTO api_keys (user_id, model_name, api_key) 
-                VALUES (?, ?, ?)
+            conn = self._connect()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                INSERT INTO api_keys (user_id, ai_service, api_key)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id, ai_service) DO NOTHING;
             """, (user_id, model_name, api_key))
-            self.conn.commit()
-            # Перевіряємо, чи був вставлений новий рядок
-            return self.cursor.rowcount > 0
+            
+            conn.commit()
+            return cursor.rowcount > 0
+            
         except Exception as e:
-            print(f"Помилка при додаванні ключа: {e}")
+            print(f"Помилка додавання ключа: {e}")
             return False
+        finally:
+            if conn:
+                conn.close()
 
     def get_keys_by_user(self, user_id: int) -> Dict[str, List[str]]:
         """Завантажує всі ключі для користувача, згруповані за моделлю."""
-        self._ensure_connected()
-        self.cursor.execute("""
-            SELECT model_name, api_key FROM api_keys WHERE user_id = ?
-        """, (user_id,))
-        
-        results: Dict[str, List[str]] = {}
-        
-        for model_name, api_key in self.cursor.fetchall():
-            if model_name not in results:
-                results[model_name] = []
-            results[model_name].append(api_key)
+        conn = None
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
             
-        return results
+            cursor.execute("""
+                SELECT ai_service, api_key FROM api_keys WHERE user_id = %s
+            """, (user_id,))
+            
+            results: Dict[str, List[str]] = {}
+            
+            for ai_service, api_key in cursor.fetchall():
+                if ai_service not in results:
+                    results[ai_service] = []
+                results[ai_service].append(api_key)
+            
+            return results
+            
+        except Exception as e:
+            print(f"Помилка завантаження ключів: {e}")
+            return {}
+        finally:
+            if conn:
+                conn.close()
 
     def close(self):
-        self.conn.close()
+        """Закриває з'єднання (якщо воно існує)."""
+        pass
 
-# Ініціалізуємо менеджер БД
-db_manager = DatabaseManager()
+# Створюємо глобальний об'єкт DatabaseManager
+DB_MANAGER = DatabaseManager()
+

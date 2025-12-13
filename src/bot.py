@@ -22,7 +22,7 @@ from telegram.ext import (
 
 from ai_clients import BaseAI, AI_CLIENTS 
 from debate_manager import DebateSession, DebateStatus
-from database import db_manager # <--- НОВИЙ ІМПОРТ
+from database import DB_MANAGER  # Імпортуємо глобальний об'єкт
 
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -103,7 +103,7 @@ def build_ai_clients(user_id: int) -> Optional[Dict[str, BaseAI]]:
 
     # 2. Якщо ключів немає в кеші, завантажити їх з бази даних
     if not keys_map:
-        keys_map = db_manager.get_keys_by_user(user_id)
+        keys_map = DB_MANAGER.get_keys_by_user(user_id)
         if keys_map:
             cached_user_api_keys[user_id] = keys_map
 
@@ -181,7 +181,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     username = user.username or "Н/Д"
 
-    balance, join_date = db_manager.get_user_profile(user_id, username)
+    balance, join_date = DB_MANAGER.get_user_profile(user_id, username)
 
     message = (
         "👤 <b>Ваш Профіль</b>\n\n"
@@ -211,7 +211,7 @@ async def receive_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         if is_valid:
             # --- 1. ЗБЕРІГАННЯ В БД ---
-            is_new = db_manager.add_key(user_id, model_name, api_key)
+            is_new = DB_MANAGER.add_key(user_id, model_name, api_key)
 
             if not is_new:
                 # Ключ вже існує, просто оновлюємо кеш
@@ -412,6 +412,9 @@ def main_bot_setup(token: str) -> Application:
     
     if APPLICATION is not None:
         return APPLICATION
+    
+    # 1. Створюємо таблиці БД при першому запуску
+    DB_MANAGER._create_tables()
     
     # Ініціалізуємо Application з переданим токеном
     APPLICATION = Application.builder().token(token).build()
