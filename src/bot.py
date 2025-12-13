@@ -841,12 +841,41 @@ def main_bot_setup(token: str) -> Application:
     return APPLICATION
 
 
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробляє помилки без зупинки бота."""
+    print(f"Update {update} caused error {context.error}")
+    
+    # Логуємо помилку
+    if hasattr(context.error, '__traceback__'):
+        import traceback
+        traceback.print_exception(type(context.error), context.error, context.error.__traceback__)
+
+
 def main() -> None:
-    """Запуск бота у режимі Polling."""
+    """Запуск бота у режимі Polling з перевіркою однієї інстанції."""
+    import time
+    import socket
+    
+    # Створюємо унікальний ідентифікатор для цієї інстанції
+    instance_id = f"{socket.gethostname()}_{os.getpid()}_{int(time.time() * 1000) % 10000}"
+    
     application = main_bot_setup(TELEGRAM_BOT_TOKEN)
     
-    print("Бот запущено у режимі Polling...")
-    application.run_polling(poll_interval=1.0, timeout=10)
+    # Додаємо Error Handler
+    application.add_error_handler(error_handler)
+    
+    print(f"Бот запущено у режимі Polling...")
+    print(f"Instance ID: {instance_id}")
+    print("Забезпечуємо єдину активну інстанцію...")
+    
+    try:
+        application.run_polling(poll_interval=1.0, timeout=10, allowed_updates=None)
+    except Exception as e:
+        if "Conflict" in str(e):
+            print("\n❌ HELP: Другий бот вже запущений!")
+            print("Вирішення: Видаліть webhook через: python reset_webhook.py")
+            print("Потім переробляйте на Railway!")
+        raise
 
 
 if __name__ == "__main__":
