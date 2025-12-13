@@ -4,19 +4,10 @@ from typing import Dict, List, Tuple
 from enum import Enum
 import abc
 
-# Імпорт для роботи з лімітами
-try:
-    from database import DB_MANAGER
-except ImportError:
-    # Заглушка, якщо файл запускається окремо
-    class MockDBManager:
-        def decrement_calls(self, key_id: int, count: int = 1) -> bool:
-            print(f"MockDB: Decrementing {count} calls for key {key_id}")
-            return True
-    DB_MANAGER = MockDBManager()
-
-# Припускаємо, що BaseAI імпортовано з ai_clients
-class BaseAI(abc.ABC):
+# Імпортуємо DB_MANAGER та BaseAI, щоб вони були доступні
+from database import DB_MANAGER
+# Припускаємо, що BaseAI імпортовано з ai_clients (якщо запускатиметься окремо)
+class BaseAI(abc.ABC): 
     pass 
 
 class DebateStatus(Enum):
@@ -26,11 +17,13 @@ class DebateStatus(Enum):
 class DebateSession:
     """Керує всіма раундами, історією та промптингом для дебатів."""
     
-    # ОНОВЛЕНО: додано key_ids_map
     def __init__(self, topic: str, clients_map: Dict[str, BaseAI], key_ids_map: Dict[str, int], max_rounds: int = 3): 
         self.topic = topic
+        # {alias_name: client_object}
         self.clients: Dict[str, BaseAI] = clients_map
-        self.key_ids: Dict[str, int] = key_ids_map # НОВЕ: Зберігаємо ID ключів
+        # {alias_name: key_id}
+        self.key_ids: Dict[str, int] = key_ids_map
+        # Історія тепер зберігає повні результати раунду: List[Dict[AI_Name, Response_Text]]
         self.history: List[Dict[str, str]] = [] 
         self.round = 0
         self.is_running = False
@@ -41,58 +34,58 @@ class DebateSession:
         Генерує динамічний системний промпт для конкретної моделі на поточному раунді.
         """
         clients_list = list(self.clients.keys())
-        ai1_name, ai2_name = clients_list[0], clients_list[1]
+        opponent_name = next(name for name in clients_list if name != model_name)
         
-        # Динамічна роль
-        if model_name == ai1_name:
-            role = f"Ти - {ai1_name}. Твоя мета - переконати у своїй позиції. Ти починаєш першим."
-        else:
-            role = f"Ти - {ai2_name}. Твоя мета - спростувати аргументи {ai1_name} та переконати у своїй позиції."
-
-        return (
-            f"{role}\n"
-            f"Формат відповіді: [Ваш аргумент].\n"
-            f"Будь ласка, будь лаконічним, чітким та переконливим. Використовуй факти та логіку."
+        # Визначаємо, хто є "ЗА" (перший клієнт) і "ПРОТИ" (другий клієнт)
+        # Перший клієнт завжди "ЗА", другий завжди "ПРОТИ"
+        is_pro = model_name == clients_list[0]
+        side = "ЗА" if is_pro else "ПРОТИ"
+        
+        prompt = (
+            f"Ти - інтелектуальна модель **{model_name}**, яка бере участь у дебатах. "
+            f"Твій опонент: **{opponent_name}**. "
+            f"Тема: **{self.topic}**. "
+            f"Твоя позиція: **{side}**.\n\n"
+            "Твоя мета - переконати читача у правильності своєї позиції, використовуючи логічні аргументи, факти та чітку структуру. "
+            "Кожен твій хід повинен:\n"
+            "1. Відповідати на аргументи, висунуті опонентом у попередньому раунді (якщо це не перший раунд).\n"
+            "2. Розвивати твою основну тезу.\n"
+            "3. Бути лаконічним і мати максимум 3-4 абзаци.\n"
+            f"Зараз **Раунд {self.round + 1}** з {self.MAX_ROUNDS}. Будь переконливим!"
         )
+        return prompt
 
     def get_full_history(self) -> str:
-        """Форматує історію дебатів для включення в промпт наступного раунду."""
-        if not self.history:
-            return "Дебати ще не розпочато."
-        
-        formatted_history = []
+        """Форматує повну історію дебатів для передачі у промпт."""
+        history_text = ""
         for i, round_data in enumerate(self.history):
-            round_str = f"--- Раунд {i + 1} ---\n"
+            history_text += f"\n--- РАУНД {i+1} ---\n"
             for name, response in round_data.items():
-                round_str += f"[{name}]: {response}\n"
-            formatted_history.append(round_str)
-            
-        return "\n".join(formatted_history)
+                history_text += f"{name}: {response}\n"
+        return history_text.strip()
 
     async def run_next_round(self) -> Tuple[str, str]:
-        """
-        Виконує наступний раунд дебатів, генеруючи відповіді обох AI 
-        та декрементуючи їхні ліміти запитів.
-        """
+        """Виконує наступний раунд дебатів, генерує відповіді та зменшує ліміти."""
+        
         if self.round >= self.MAX_ROUNDS:
             raise ValueError("Дебати завершено. Немає більше раундів.")
 
-        # --- НОВА ПЕРЕВІРКА ТА ДЕКРЕМЕНТ ЛІМІТУ ---
+        self.is_running = True
+        
+        # Визначаємо, хто ходить першим
         client_names = list(self.clients.keys())
         ai1_name, ai2_name = client_names[0], client_names[1]
-
-        # Декрементуємо лічильник на 1 для AI1. Якщо не спрацювало, кидаємо помилку.
-        if not DB_MANAGER.decrement_calls(self.key_ids[ai1_name], count=1):
-            raise Exception(f"Ліміт запитів для ключа '{ai1_name}' вичерпано.")
-            
-        # Декрементуємо лічильник на 1 для AI2.
-        if not DB_MANAGER.decrement_calls(self.key_ids[ai2_name], count=1):
-            raise Exception(f"Ліміт запитів для ключа '{ai2_name}' вичерпано.")
         
-        # ЛОГІКА ДЕКРЕМЕНТУ ПРОЙШЛА УСПІШНО
-        self.is_running = True
-        self.round += 1
+        # Перевірка лімітів перед запуском
+        remaining1 = DB_MANAGER.get_remaining_calls(self.key_ids[ai1_name])
+        remaining2 = DB_MANAGER.get_remaining_calls(self.key_ids[ai2_name])
         
+        if remaining1 is None or remaining1 < 1:
+            raise Exception(f"Ліміт запитів вичерпано для {ai1_name} ({remaining1} залишилося).")
+        if remaining2 is None or remaining2 < 1:
+            raise Exception(f"Ліміт запитів вичерпано для {ai2_name} ({remaining2} залишилося).")
+        
+        # Історія для поточного промпту
         debate_history = self.get_full_history()
 
         # 1. Створення завдань для обох моделей
@@ -111,11 +104,32 @@ class DebateSession:
         # 2. Очікування результатів
         response1, response2 = await asyncio.gather(task1, task2)
         
-        current_round_history = {
+        # 3. Зменшення лімітів ПІСЛЯ успішного отримання відповідей
+        # Якщо будь-яка з цих операцій не вдасться, це викличе помилку, і поточний раунд не буде збережено.
+        
+        # Примітка: Якщо в response1/response2 є помилка (повернена стрінгом), 
+        # ми також повинні зупинити процес і не зменшувати ліміти,
+        # але на практиці, якщо генерація була запущена, ліміт має зменшитись.
+        # Для простоти, зменшуємо ліміти одразу після отримання відповіді.
+        
+        # Спроба декременту
+        decrement_success1 = DB_MANAGER.decrement_calls(self.key_ids[ai1_name])
+        decrement_success2 = DB_MANAGER.decrement_calls(self.key_ids[ai2_name])
+
+        if not decrement_success1 or not decrement_success2:
+            # Це дуже малоймовірно, якщо ми перевірили ліміт раніше, але можливо при одночасному використанні.
+            raise Exception("Критична помилка: Не вдалося оновити ліміт запитів у базі даних.")
+
+
+        current_round_data = {
             ai1_name: response1,
             ai2_name: response2
         }
-        self.history.append(current_round_history)
-        self.is_running = False
+        
+        self.history.append(current_round_data)
+        self.round += 1
+        
+        if self.round >= self.MAX_ROUNDS:
+            self.is_running = False
         
         return response1, response2

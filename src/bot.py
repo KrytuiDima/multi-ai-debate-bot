@@ -15,7 +15,7 @@ from telegram.ext import (
     ConversationHandler
 )
 
-# Імпортуємо тільки те, що дійсно використовується, щоб уникнути помилок імпорту
+# Виправляємо імпорт: AI_CLIENTS_MAP має бути доступним
 from ai_clients import BaseAI, AI_CLIENTS_MAP 
 from debate_manager import DebateSession, DebateStatus
 from database import DB_MANAGER, decrypt_key 
@@ -94,7 +94,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обробляє команду /cancel і завершує розмову."""
     user_id = update.effective_user.id
-    await update.message.reply_text(
+    
+    # Визначаємо, звідки прийшов запит (команда чи callback)
+    if update.callback_query:
+        await update.callback_query.answer()
+        message = update.callback_query.message
+    else:
+        message = update.message
+        
+    await message.reply_text(
         'Скасовано. Повертаємось до головного меню.',
         reply_markup=get_main_menu(user_id)
     )
@@ -212,6 +220,9 @@ async def addkey_receive_limit(update: Update, context: ContextTypes.DEFAULT_TYP
         return AWAITING_ALIAS
     else:
         # Перший вхід у стан: просимо ліміт
+        # Визначаємо, яке повідомлення редагувати
+        
+        # Якщо перехід після отримання ключа (відповідь на message), то надсилаємо нове message
         await update.message.reply_text(
             f"**Введіть місячний ліміт запитів** для ключа **{AVAILABLE_SERVICES[service]}**.\n"
             f"*{info}*\n\n"
@@ -259,8 +270,10 @@ def get_key_keyboard(user_id: int, prefix: str) -> InlineKeyboardMarkup:
     keyboard = []
     
     for alias, service, remaining, key_id in keys:
-        display_name = f"{alias} ({AVAILABLE_SERVICES[service]}) [ {remaining} ]"
-        keyboard.append([InlineKeyboardButton(display_name, callback_data=f'{prefix}_{alias}')])
+        # Додаємо умову: показуємо ключ, лише якщо залишився хоча б 1 запит
+        if remaining > 0:
+            display_name = f"{alias} ({AVAILABLE_SERVICES[service]}) [ {remaining} ]"
+            keyboard.append([InlineKeyboardButton(display_name, callback_data=f'{prefix}_{alias}')])
         
     return InlineKeyboardMarkup(keyboard)
 
@@ -269,30 +282,23 @@ async def debate_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     user_id = update.effective_user.id
     keys = DB_MANAGER.get_user_keys_with_alias(user_id)
     
-    if len(keys) < 2:
-        # Визначаємо, звідки прийшов запит для коректної відповіді
-        if update.callback_query:
-            await update.callback_query.answer()
-            await update.callback_query.edit_message_text(
-                "❌ У вас має бути додано мінімум два API ключі для проведення дебатів. Будь ласка, додайте ще ключі.",
-                reply_markup=get_main_menu(user_id)
-            )
-        else:
-            await update.message.reply_text(
-                "❌ У вас має бути додано мінімум два API ключі для проведення дебатів. Будь ласка, додайте ще ключі.",
-                reply_markup=get_main_menu(user_id)
-            )
-        return ConversationHandler.END
-
+    # Визначаємо, звідки прийшов запит для коректної відповіді
     if update.callback_query:
         await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
-            "Введіть тему, на яку будуть дебатувати AI (напр. 'Чи повинна влада регулювати ШІ?'):"
-        )
+        message = update.callback_query.message
     else:
-        await update.message.reply_text(
-            "Введіть тему, на яку будуть дебатувати AI (напр. 'Чи повинна влада регулювати ШІ?'):"
+        message = update.message
+
+    if len(keys) < 2:
+        await message.reply_text(
+            "❌ У вас має бути додано мінімум два API ключі для проведення дебатів. Будь ласка, додайте ще ключі.",
+            reply_markup=get_main_menu(user_id)
         )
+        return ConversationHandler.END
+
+    await message.reply_text(
+        "Введіть тему, на яку будуть дебатувати AI (напр. 'Чи повинна влада регулювати ШІ?'):"
+    )
     
     return AWAITING_DEBATE_TOPIC
 
@@ -316,9 +322,17 @@ async def debate_rounds_chosen(update: Update, context: ContextTypes.DEFAULT_TYP
     rounds = int(query.data.split('_')[1])
     context.user_data['debate_rounds'] = rounds
     
+    keyboard = get_key_keyboard(update.effective_user.id, 'ai1')
+    if not keyboard.inline_keyboard:
+         await query.edit_message_text(
+            "❌ Немає доступних ключів із достатнім лімітом запитів (мінімум 1).",
+            reply_markup=get_main_menu(update.effective_user.id)
+        )
+         return ConversationHandler.END
+
     await query.edit_message_text(
         "Оберіть **AI 1** (перший учасник):",
-        reply_markup=get_key_keyboard(update.effective_user.id, 'ai1'),
+        reply_markup=keyboard,
         parse_mode='Markdown'
     )
     return AWAITING_DEBATE_AI1
@@ -331,18 +345,28 @@ async def debate_ai1_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     alias1 = query.data.split('_')[1]
     context.user_data['debate_ai1_alias'] = alias1
     
-    # Фільтруємо клавіатуру, щоб не пропонувати той самий AI
+    # Фільтруємо клавіатуру, щоб не пропонувати той самий AI і перевіряємо ліміт
     keys = DB_MANAGER.get_user_keys_with_alias(update.effective_user.id)
     keyboard = []
     for alias, service, remaining, key_id in keys:
-        if alias != alias1:
+        if alias != alias1 and remaining > 0:
             display_name = f"{alias} ({AVAILABLE_SERVICES[service]}) [ {remaining} ]"
             keyboard.append([InlineKeyboardButton(display_name, callback_data=f'ai2_{alias}')])
+            
+    final_keyboard = InlineKeyboardMarkup(keyboard)
+
+    if not final_keyboard.inline_keyboard:
+         await query.edit_message_text(
+            f"❌ Ви обрали **{alias1}** як AI 1, але не залишилося інших ключів із достатнім лімітом запитів (мінімум 1) для AI 2.",
+            reply_markup=get_main_menu(update.effective_user.id),
+            parse_mode='Markdown'
+        )
+         return ConversationHandler.END
 
     await query.edit_message_text(
         f"✅ Ви обрали **{alias1}** як AI 1.\n\n"
         f"Оберіть **AI 2** (другий учасник):",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=final_keyboard,
         parse_mode='Markdown'
     )
     return AWAITING_DEBATE_AI2
@@ -354,6 +378,7 @@ async def debate_ai2_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     
     context.user_data['debate_ai2_alias'] = query.data.split('_')[1]
 
+    # Використовуємо edit_message_text, оскільки ми в callback'і
     await query.edit_message_text("⏳ Ініціалізація дебатів...")
     
     # Викликаємо функцію, яка почне дебати
@@ -362,7 +387,7 @@ async def debate_ai2_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def start_debate_with_clients(update_or_query: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Остаточна підготовка, перевірка лімітів та запуск сесії."""
-    # Отримуємо об'єкт повідомлення для відповіді, незалежно від того, чи це Update чи CallbackQuery
+    # Отримуємо об'єкт повідомлення для відповіді
     message = update_or_query.message if hasattr(update_or_query, 'message') else update_or_query
     
     user_id = message.chat.id
@@ -389,7 +414,7 @@ async def start_debate_with_clients(update_or_query: Update, context: ContextTyp
         
         # Перевірка: чи вистачить запитів хоча б на 1 раунд (мінімум 1 запит на кожного)
         if (remaining1 is None or remaining1 < 1) or (remaining2 is None or remaining2 < 1):
-            msg = "❌ **Дебати не можуть розпочатися:** У одного з вибраних AI закінчилися запити. "
+            msg = "❌ **Дебати не можуть розпочатися:** У одного з вибраних AI закінчилися запити (потрібно мінімум 1 на кожного). "
             if remaining1 is not None and remaining1 < 1: msg += f"'{alias1}' = {remaining1} "
             if remaining2 is not None and remaining2 < 1: msg += f"'{alias2}' = {remaining2}"
             msg += ". Будь ласка, додайте новий ключ або збільште ліміт."
@@ -401,7 +426,7 @@ async def start_debate_with_clients(update_or_query: Update, context: ContextTyp
         api_key1 = decrypt_key(encrypted_key1)
         api_key2 = decrypt_key(encrypted_key2)
 
-        # Використовуємо AI_CLIENTS_MAP для створення екземплярів
+        # Ініціалізація клієнтів за допомогою AI_CLIENTS_MAP
         client1 = AI_CLIENTS_MAP[service1](api_key=api_key1) 
         client2 = AI_CLIENTS_MAP[service2](api_key=api_key2) 
         
@@ -431,6 +456,7 @@ async def start_debate_with_clients(update_or_query: Update, context: ContextTyp
             f"Натисніть *'Наступний Раунд'* для продовження."
         )
         
+        # Відповідаємо на message, якщо це callback, або надсилаємо нове, якщо це команда
         await message.reply_text(
             initial_message,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Наступний Раунд", callback_data='run_round')]]),
@@ -471,7 +497,8 @@ async def run_debate_round(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"**{ai2_name}:**\n{response2}\n"
         )
         
-        await query.edit_message_text(round_text, parse_mode='Markdown')
+        # Відправляємо нове повідомлення з результатами, оскільки попереднє було "Думають..."
+        await query.message.reply_text(round_text, parse_mode='Markdown')
 
         # 2. Оновлення інформації про ліміти у відповіді
         remaining1 = DB_MANAGER.get_remaining_calls(session.key_ids[ai1_name])
@@ -494,15 +521,23 @@ async def run_debate_round(update: Update, context: ContextTypes.DEFAULT_TYPE) -
              return ConversationHandler.END
         
         # 4. Наступний раунд
+        # Перевірка, чи вистачить лімітів для наступного раунду (потрібно 1 на кожного)
+        if remaining1 < 1 or remaining2 < 1:
+             msg = f"❌ **Дебати зупинено:** У одного з AI закінчилися запити. {ai1_name}: {remaining1}, {ai2_name}: {remaining2}. "
+             await query.message.reply_text(msg, parse_mode='Markdown', reply_markup=get_main_menu(update.effective_user.id))
+             context.user_data.pop('current_debate_session', None)
+             return ConversationHandler.END
+             
         await query.message.reply_text(
             f"Дебати тривають. Наступний раунд {session.round + 1} з {session.MAX_ROUNDS}.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Наступний Раунд", callback_data='run_round')]])
         )
         
     except Exception as e:
-        # Обробка помилки вичерпання ліміту
-        if "Ліміт запитів" in str(e):
-             await query.message.reply_text(f"❌ **Дебати зупинено:** {e}", reply_markup=get_main_menu(update.effective_user.id), parse_mode='Markdown')
+        # Обробка помилки вичерпання ліміту або іншої критичної помилки
+        error_msg = str(e)
+        if "Ліміт запитів" in error_msg or "Критична помилка" in error_msg:
+             await query.message.reply_text(f"❌ **Дебати зупинено:** {error_msg}", reply_markup=get_main_menu(update.effective_user.id), parse_mode='Markdown')
         else:
             logger.error(f"Помилка в раунді дебатів: {e}")
             await query.message.reply_text(f"❌ Сталася помилка в раунді: {e}", reply_markup=get_main_menu(update.effective_user.id))
@@ -561,7 +596,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "   - **1 раунд дебатів = 2 запити** (один на AI 1, один на AI 2).\n\n"
         "2. **/debate** або кнопка `⚔️ Розпочати Дебати`:\n"
         "   - Оберіть тему, кількість раундів та два AI для участі.\n"
-        "   - Після кожного раунду бот показує **залишок запитів** для кожного ключа.\n\n"
+        "   - Бот автоматично перевіряє **залишок запитів** перед кожним раундом.\n\n"
         "3. **/mykeys** або кнопка `🔑 Мої Ключі`:\n"
         "   - Перегляньте список своїх ключів, їхній сервіс та поточний залишок запитів.\n\n"
         "4. **/history**:\n"
@@ -646,4 +681,6 @@ def main() -> None:
     application.run_polling(poll_interval=1.0)
 
 if __name__ == '__main__':
+    # Переконуємось, що ініціалізація DB відбувається до запуску.
+    # DB_MANAGER створюється під час імпорту database.py.
     main()
