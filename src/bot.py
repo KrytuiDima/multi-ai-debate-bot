@@ -15,7 +15,7 @@ from telegram.ext import (
     ConversationHandler
 )
 
-# Імпортуємо всі необхідні компоненти з інших модулів
+# Імпортуємо тільки те, що дійсно використовується, щоб уникнути помилок імпорту
 from ai_clients import BaseAI, AI_CLIENTS_MAP 
 from debate_manager import DebateSession, DebateStatus
 from database import DB_MANAGER, decrypt_key 
@@ -253,12 +253,8 @@ async def addkey_receive_alias(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --- 2. ЛОГІКА ДЕБАТІВ ---
 
-# ... (дебатні стани: AWAITING_DEBATE_TOPIC, AWAITING_DEBATE_AI1, AWAITING_DEBATE_AI2)
-# Ця логіка є стандартною FSM, але вона повинна бути імплементована. 
-# Для стислості, я наведу лише ключові функції, які взаємодіють з оновленою логікою ключів.
-
-# Приклад: Функція, яка повертає клавіатуру з ключами
 def get_key_keyboard(user_id: int, prefix: str) -> InlineKeyboardMarkup:
+    """Генерує клавіатуру з ключами користувача, включаючи залишок запитів."""
     keys = DB_MANAGER.get_user_keys_with_alias(user_id)
     keyboard = []
     
@@ -274,19 +270,30 @@ async def debate_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     keys = DB_MANAGER.get_user_keys_with_alias(user_id)
     
     if len(keys) < 2:
-        await (update.callback_query.edit_message_text if update.callback_query else update.message.reply_text)(
-            "❌ У вас має бути додано мінімум два API ключі для проведення дебатів. Будь ласка, додайте ще ключі.",
-            reply_markup=get_main_menu(user_id)
-        )
+        # Визначаємо, звідки прийшов запит для коректної відповіді
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(
+                "❌ У вас має бути додано мінімум два API ключі для проведення дебатів. Будь ласка, додайте ще ключі.",
+                reply_markup=get_main_menu(user_id)
+            )
+        else:
+            await update.message.reply_text(
+                "❌ У вас має бути додано мінімум два API ключі для проведення дебатів. Будь ласка, додайте ще ключі.",
+                reply_markup=get_main_menu(user_id)
+            )
         return ConversationHandler.END
 
-    await (update.callback_query.edit_message_text if update.callback_query else update.message.reply_text)(
-        "Введіть тему, на яку будуть дебатувати AI (напр. 'Чи повинна влада регулювати ШІ?'):"
-    )
-    
     if update.callback_query:
         await update.callback_query.answer()
-        
+        await update.callback_query.edit_message_text(
+            "Введіть тему, на яку будуть дебатувати AI (напр. 'Чи повинна влада регулювати ШІ?'):"
+        )
+    else:
+        await update.message.reply_text(
+            "Введіть тему, на яку будуть дебатувати AI (напр. 'Чи повинна влада регулювати ШІ?'):"
+        )
+    
     return AWAITING_DEBATE_TOPIC
 
 async def debate_topic_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -311,7 +318,8 @@ async def debate_rounds_chosen(update: Update, context: ContextTypes.DEFAULT_TYP
     
     await query.edit_message_text(
         "Оберіть **AI 1** (перший учасник):",
-        reply_markup=get_key_keyboard(update.effective_user.id, 'ai1')
+        reply_markup=get_key_keyboard(update.effective_user.id, 'ai1'),
+        parse_mode='Markdown'
     )
     return AWAITING_DEBATE_AI1
 
@@ -348,16 +356,13 @@ async def debate_ai2_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     await query.edit_message_text("⏳ Ініціалізація дебатів...")
     
-    # Викликаємо функцію, яка почне дебати (потрібен об'єкт Update з повідомленням)
-    # Оскільки ми в callback'і, створюємо mock-повідомлення.
-    # Найкраще переписати `start_debate_with_clients` на приймання query
-    
+    # Викликаємо функцію, яка почне дебати
     return await start_debate_with_clients(query, context)
 
 
 async def start_debate_with_clients(update_or_query: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Остаточна підготовка, перевірка лімітів та запуск сесії."""
-    # Якщо прийшов CallbackQuery, беремо message
+    # Отримуємо об'єкт повідомлення для відповіді, незалежно від того, чи це Update чи CallbackQuery
     message = update_or_query.message if hasattr(update_or_query, 'message') else update_or_query
     
     user_id = message.chat.id
@@ -372,7 +377,7 @@ async def start_debate_with_clients(update_or_query: Update, context: ContextTyp
         key2_details = DB_MANAGER.get_key_details_by_alias(user_id, alias2)
 
         if not key1_details or not key2_details:
-             await message.reply_text("❌ Помилка: Не вдалося знайти один із вибраних ключів у базі даних.")
+             await message.reply_text("❌ Помилка: Не вдалося знайти один із вибраних ключів у базі даних.", reply_markup=get_main_menu(user_id))
              return ConversationHandler.END
 
         key1_id, service1, encrypted_key1 = key1_details
@@ -396,9 +401,11 @@ async def start_debate_with_clients(update_or_query: Update, context: ContextTyp
         api_key1 = decrypt_key(encrypted_key1)
         api_key2 = decrypt_key(encrypted_key2)
 
+        # Використовуємо AI_CLIENTS_MAP для створення екземплярів
         client1 = AI_CLIENTS_MAP[service1](api_key=api_key1) 
         client2 = AI_CLIENTS_MAP[service2](api_key=api_key2) 
         
+        # Зберігаємо імена для відображення
         ai1_name = f"*{alias1}* ({AVAILABLE_SERVICES[service1]})"
         ai2_name = f"*{alias2}* ({AVAILABLE_SERVICES[service2]})"
         
@@ -452,7 +459,7 @@ async def run_debate_round(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     ai1_name, ai2_name = list(session.clients.keys())
 
     try:
-        await query.edit_message_text(f"⏳ Раунд {session.round + 1} з {session.MAX_ROUNDS}: {ai1_name} та {ai2_name} думають...")
+        await query.edit_message_text(f"⏳ Раунд {session.round + 1} з {session.MAX_ROUNDS}: {ai1_name} та {ai2_name} думають...", parse_mode='Markdown')
         
         # run_next_round: асинхронно отримує відповіді та виконує DB_MANAGER.decrement_calls
         response1, response2 = await session.run_next_round() 
