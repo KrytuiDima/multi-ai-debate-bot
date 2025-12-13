@@ -32,8 +32,49 @@ APPLICATION = None # Тут буде зберігатися об'єкт Applicat
 # --- КІНЕЦЬ НОВИХ ЗМІН ---
 
 # --- СТАНИ FSM ---
-# FSM використовується лише для ОДНОГО завдання: отримання API ключа
+# FSM використовується для ОДНОГО завдання: отримання API ключа
 WAITING_API_KEY = 1
+CHOOSING_ROUNDS = 2
+
+# Раунди, які пропонуємо
+ROUND_OPTIONS = [2, 3, 5, 10]
+
+# --- ФУНКЦІЇ ПЕРЕВІРКИ КЛЮЧІВ ---
+
+def get_key_status() -> dict:
+    """Перевіряє наявність ключів API у змінних середовища."""
+    status = {
+        'groq': bool(os.getenv('GROQ_API_KEY')),
+        'gemini': bool(os.getenv('GEMINI_API_KEY')),
+        'claude': bool(os.getenv('ANTHROPIC_API_KEY')),
+        'deepseek': bool(os.getenv('DEEPSEEK_API_KEY'))
+    }
+    return status
+
+def get_status_message(status: dict) -> str:
+    """Формує повідомлення про статус ключів."""
+    total_set = sum(status.values())
+    
+    messages = ["🔑 <b>Статус Ключів AI</b>:\n"]
+    
+    key_names = {
+        'groq': "Llama3 (Groq)",
+        'gemini': "Gemini",
+        'claude': "Claude",
+        'deepseek': "DeepSeek"
+    }
+
+    for key, name in key_names.items():
+        icon = '✅' if status[key] else '❌'
+        messages.append(f"{icon} {name}")
+    
+    messages.append(f"\n<b>Всього активовано: {total_set} з 4</b>.")
+    
+    if total_set < 2:
+        messages.append("\n<b>⚠️ Щоб розпочати дебати, потрібно мінімум 2 активні моделі.</b>")
+    
+    return "\n".join(messages)
+
 
 # --- ГЛОБАЛЬНЕ ЗБЕРІГАННЯ ДАНИХ (В RAM) ---
 user_clients: Dict[int, Dict[str, BaseAI]] = {} 
@@ -99,6 +140,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     # Повертаємо ConversationHandler.END, оскільки ми не в FSM для навігації
     return ConversationHandler.END
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показує статус налаштованих ключів API."""
+    status = get_key_status()
+    status_msg = get_status_message(status)
+    
+    await update.message.reply_text(
+        f"Привіт! Я бот для AI-дебатів.\n\n{status_msg}",
+        parse_mode="HTML"
+    )
 
 
 def build_ai_clients(user_id: int) -> Optional[Dict[str, BaseAI]]:
@@ -201,6 +253,85 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
+async def choose_rounds_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Пропонує вибір кількості раундів для дебатів."""
+    keyboard = []
+    
+    # Створення кнопок для фіксованих значень
+    for r in ROUND_OPTIONS:
+        keyboard.append(InlineKeyboardButton(str(r), callback_data=f"rounds_{r}"))
+    
+    # Додавання кнопки для введення власного значення
+    keyboard.append(InlineKeyboardButton("Ввести своє число ✍️", callback_data="rounds_custom"))
+    
+    reply_markup = InlineKeyboardMarkup([keyboard])
+    
+    await update.message.reply_text(
+        "Оберіть кількість раундів для дебатів (мінімум 2):",
+        reply_markup=reply_markup,
+        parse_mode="HTML"
+    )
+    
+    return CHOOSING_ROUNDS
+
+
+async def rounds_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обробляє вибір кількості раундів кнопкою."""
+    query = update.callback_query
+    await query.answer()
+    
+    choice = query.data.split('_')[1]
+    
+    if choice == 'custom':
+        # Перехід до очікування введення користувача
+        await query.edit_message_text(
+            "Введіть бажану кількість раундів (число, більше 1):",
+            parse_mode="HTML"
+        )
+        return CHOOSING_ROUNDS
+    
+    try:
+        rounds = int(choice)
+        context.user_data['rounds'] = rounds
+        await query.edit_message_text(
+            f"Кількість раундів встановлено: <b>{rounds}</b>.\n"
+            f"Тепер оберіть тему дебатів.",
+            parse_mode="HTML"
+        )
+        return ConversationHandler.END
+    except ValueError:
+        await query.edit_message_text("Помилка вибору. Спробуйте ще раз.")
+        return CHOOSING_ROUNDS
+
+
+async def receive_custom_rounds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обробляє введення користувачем власного числа раундів."""
+    text = update.message.text
+    
+    try:
+        rounds = int(text.strip())
+        
+        if rounds <= 1:
+            await update.message.reply_text(
+                "Кількість раундів має бути <b>більше 1</b>. Спробуйте ще раз:",
+                parse_mode="HTML"
+            )
+            return CHOOSING_ROUNDS
+        
+        context.user_data['rounds'] = rounds
+        await update.message.reply_text(
+            f"Кількість раундів встановлено: <b>{rounds}</b>.\n"
+            f"Тепер оберіть тему дебатів.",
+            parse_mode="HTML"
+        )
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text(
+            "Некоректний формат. Будь ласка, введіть числове значення більше 1.",
+            parse_mode="HTML"
+        )
+        return CHOOSING_ROUNDS
 
 
 async def receive_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -428,15 +559,20 @@ def main_bot_setup(token: str) -> Application:
     # Ініціалізуємо Application з переданим токеном
     APPLICATION = Application.builder().token(token).build()
     
-    # ConversationHandler для FSM (тільки для введення API ключа)
+    # ConversationHandler для FSM (введення API ключа та вибір раундів)
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
+            CommandHandler("rounds", choose_rounds_command),
             CallbackQueryHandler(main_menu_callback, pattern='^menu_key_'),
         ],
         states={
             WAITING_API_KEY: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_key),
+            ],
+            CHOOSING_ROUNDS: [
+                CallbackQueryHandler(rounds_callback_handler, pattern="^rounds_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_custom_rounds),
             ],
         },
         fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
@@ -444,6 +580,7 @@ def main_bot_setup(token: str) -> Application:
     
     # Реєструємо всі обробники
     APPLICATION.add_handler(CommandHandler("start", start))
+    APPLICATION.add_handler(CommandHandler("status", status_command))
     APPLICATION.add_handler(CommandHandler("profile", show_profile))
     APPLICATION.add_handler(conv_handler)
     
