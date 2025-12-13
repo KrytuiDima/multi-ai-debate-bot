@@ -18,10 +18,9 @@ MODELS_MAP = {
 
 class BaseAI(abc.ABC):
     """Абстрактний базовий клас для всіх AI-клієнтів"""
-    def __init__(self, api_key: str, model_name_map: str):
-        self.api_key = api_key
-        self.model_name = model_name_map 
-        self.model_map_key = model_name_map
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        self.model_map_key = model_name
 
     @abc.abstractmethod
     async def validate_key(self) -> bool:
@@ -36,6 +35,12 @@ class BaseAI(abc.ABC):
 # --- КЛІЄНТИ ---
 
 class GroqClient(BaseAI):
+    def __init__(self):
+        super().__init__('Llama3 (Groq)')
+        self.api_key = os.getenv('GROQ_API_KEY')
+        if not self.api_key:
+            raise ValueError("GROQ_API_KEY не встановлено у змінних середовища")
+    
     async def validate_key(self) -> bool:
         """Перевірка ключа Groq."""
         try:
@@ -75,6 +80,12 @@ class GroqClient(BaseAI):
 
 
 class GeminiClient(BaseAI):
+    def __init__(self):
+        super().__init__('Gemini')
+        self.api_key = os.getenv('GEMINI_API_KEY')
+        if not self.api_key:
+            raise ValueError("GEMINI_API_KEY не встановлено у змінних середовища")
+    
     async def validate_key(self) -> bool:
         """Перевірка ключа Gemini."""
         try:
@@ -106,8 +117,11 @@ class GeminiClient(BaseAI):
 
 class ClaudeAI(BaseAI):
     """Обгортка для моделі Anthropic Claude."""
-    def __init__(self, api_key: str):
-        super().__init__(api_key, "Claude")
+    def __init__(self):
+        super().__init__("Claude")
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY не встановлено у змінних середовища")
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model_name = "claude-3-haiku-20240307"
 
@@ -146,9 +160,11 @@ class ClaudeAI(BaseAI):
 
 class DeepSeekAI(BaseAI):
     """Обгортка для моделі DeepSeek."""
-    def __init__(self, api_key: str):
-        super().__init__(api_key, "DeepSeek")
-        self.api_key = api_key
+    def __init__(self):
+        super().__init__("DeepSeek")
+        self.api_key = os.getenv("DEEPSEEK_API_KEY")
+        if not self.api_key:
+            raise ValueError("DEEPSEEK_API_KEY не встановлено у змінних середовища")
         self.url = "https://api.deepseek.com/chat/completions"
         self.model_name = "deepseek-chat"
 
@@ -206,8 +222,8 @@ class DeepSeekAI(BaseAI):
 
 # Словник для зручного вибору класів
 AI_CLIENTS: Dict[str, BaseAI] = {
-    'Llama3 (Groq)': lambda api_key: GroqClient(api_key, 'Llama3 (Groq)'),
-    'Gemini': lambda api_key: GeminiClient(api_key, 'Gemini'),
-    'Claude': lambda api_key: ClaudeAI(api_key),
-    'DeepSeek': lambda api_key: DeepSeekAI(api_key),
+    'Llama3 (Groq)': GroqClient(),
+    'Gemini': GeminiClient(),
+    'Claude': ClaudeAI(),
+    'DeepSeek': DeepSeekAI(),
 }

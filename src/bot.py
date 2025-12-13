@@ -90,40 +90,20 @@ cached_user_api_keys: Dict[int, Dict[str, List[str]]] = {}
 # --------------------------
 
 def get_main_menu_markup(user_id: int) -> InlineKeyboardMarkup:
-    """Генерує розмітку головного меню в залежності від статусу ключів."""
-    # Викликаємо build_ai_clients, щоб завантажити ключі з БД (якщо їх немає в кеші)
-    clients = build_ai_clients(user_id)
-
-    count_gemini = len(clients.get('Gemini').api_keys) if clients and 'Gemini' in clients else 0
-    count_groq = len(clients.get('Llama3 (Groq)').api_keys) if clients and 'Llama3 (Groq)' in clients else 0
-    count_claude = len(clients.get('Claude').api_keys) if clients and 'Claude' in clients else 0
-    count_deepseek = len(clients.get('DeepSeek').api_keys) if clients and 'DeepSeek' in clients else 0
-
-    status_gemini = "✅" if count_gemini > 0 else "❌"
-    status_groq = "✅" if count_groq > 0 else "❌"
-    status_claude = "✅" if count_claude > 0 else "❌"
-    status_deepseek = "✅" if count_deepseek > 0 else "❌"
-
-    # Кнопки для додавання/статусу ключів
-    key_buttons = [
-        InlineKeyboardButton(f"Додати API Groq {status_groq} ({count_groq})", callback_data='menu_key_Llama3 (Groq)'),
-        InlineKeyboardButton(f"Додати API Gemini {status_gemini} ({count_gemini})", callback_data='menu_key_Gemini'),
-        InlineKeyboardButton(f"Додати API Claude {status_claude} ({count_claude})", callback_data='menu_key_Claude'),
-        InlineKeyboardButton(f"Додати API DeepSeek {status_deepseek} ({count_deepseek})", callback_data='menu_key_DeepSeek'),
-    ]
+    """Генерує розмітку головного меню."""
     # Кнопка для перегляду профілю
     profile_button = InlineKeyboardButton("👤 Профіль", callback_data='menu_profile')
 
-    # Кнопка для початку дебатів (активна, якщо є ключі для обох моделей)
-    is_ready = (count_gemini > 0 and count_groq > 0)
-
-    debate_button_text = "⚔️ Почати дебати / Задати запитання" if is_ready else "🛑 Потрібні ключі для обох моделей"
-    debate_button_data = "menu_ask" if is_ready else "menu_status"
+    # Кнопка для перегляду статусу ключів
+    status_button = InlineKeyboardButton("🔑 Статус Ключів", callback_data='menu_status')
+    
+    # Кнопка для початку дебатів
+    start_debate_button = InlineKeyboardButton("⚔️ Почати Дебати", callback_data='menu_ask')
 
     keyboard = [
-        key_buttons,
+        [status_button],
         [profile_button],
-        [InlineKeyboardButton(debate_button_text, callback_data=debate_button_data)],
+        [start_debate_button],
     ]
 
     return InlineKeyboardMarkup(keyboard)
@@ -153,36 +133,64 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показує довідку про доступні команди."""
+    help_text = (
+        "<b>📚 Доступні Команди:</b>\n\n"
+        "<b>/start</b> - Головне меню\n"
+        "<b>/status</b> - Показати статус ключів API\n"
+        "<b>/profile</b> - Перегляд профілю\n"
+        "<b>/rounds</b> - Вибір кількості раундів дебатів\n"
+        "<b>/help</b> - Ця довідка\n"
+        "<b>/setup</b> - Інструкції щодо налаштування ключів\n\n"
+        "<b>🔑 Як запустити бота:</b>\n"
+        "1. Встановіть API ключі у файл <code>.env</code>\n"
+        "2. Командуйте /rounds щоб вибрати кількість раундів\n"
+        "3. Командуйте /start щоб почати дебати"
+    )
+    await update.message.reply_text(help_text, parse_mode="HTML")
+
+
+async def setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показує інструкції щодо налаштування ключів API."""
+    setup_text = (
+        "<b>⚙️ Інструкція Налаштування API Ключів</b>\n\n"
+        "<b>1️⃣ Groq (Llama3)</b>\n"
+        "   • Перейдіть на: https://console.groq.com\n"
+        "   • Отримайте ключ\n"
+        "   • Додайте до .env: GROQ_API_KEY=your_key\n\n"
+        "<b>2️⃣ Gemini (Google)</b>\n"
+        "   • Перейдіть на: https://aistudio.google.com\n"
+        "   • Отримайте ключ\n"
+        "   • Додайте до .env: GEMINI_API_KEY=your_key\n\n"
+        "<b>3️⃣ Claude (Anthropic)</b>\n"
+        "   • Перейдіть на: https://console.anthropic.com\n"
+        "   • Отримайте ключ\n"
+        "   • Додайте до .env: ANTHROPIC_API_KEY=your_key\n\n"
+        "<b>4️⃣ DeepSeek</b>\n"
+        "   • Перейдіть на: https://platform.deepseek.com\n"
+        "   • Отримайте ключ\n"
+        "   • Додайте до .env: DEEPSEEK_API_KEY=your_key\n\n"
+        "<b>📝 Приклад .env файла:</b>\n"
+        "<code>TELEGRAM_BOT_TOKEN=your_token\n"
+        "GROQ_API_KEY=your_groq_key\n"
+        "GEMINI_API_KEY=your_gemini_key\n"
+        "ANTHROPIC_API_KEY=your_claude_key\n"
+        "DEEPSEEK_API_KEY=your_deepseek_key</code>"
+    )
+    await update.message.reply_text(setup_text, parse_mode="HTML")
+
+
 def build_ai_clients(user_id: int) -> Optional[Dict[str, BaseAI]]:
-    """Ініціалізує об'єкти клієнтів на основі списку збережених ключів (з БД)."""
-
-    # 1. Спробувати отримати ключи з кешу
-    keys_map = cached_user_api_keys.get(user_id)
-
-    # 2. Якщо ключів немає в кеші, завантажити їх з бази даних
-    if not keys_map:
-        keys_map = DB_MANAGER.get_keys_by_user(user_id)
-        if keys_map:
-            cached_user_api_keys[user_id] = keys_map
-
-    if not keys_map or len(keys_map) < 2:
+    """Повертає словник AI клієнтів, ініціалізованих з ключами з оточення."""
+    try:
+        clients = {}
+        for model_name, client in AI_CLIENTS.items():
+            clients[model_name] = client
+        return clients
+    except Exception as e:
+        print(f"Помилка ініціалізації AI клієнтів: {e}")
         return None
-
-    # 3. Ініціалізація клієнтів
-    clients = {}
-    for model_name, api_keys in keys_map.items():
-        if api_keys:
-            ClientCreator = AI_CLIENTS.get(model_name)
-            if ClientCreator:
-                # Використовуємо перший ключ для ініціалізації клієнта,
-                # але зберігаємо весь список у атрибуті .api_keys
-                client = ClientCreator(api_keys[0])
-                setattr(client, 'api_keys', api_keys)
-                clients[model_name] = client
-
-    # 4. Кешування та повернення
-    user_clients[user_id] = clients # Зберігаємо ініціалізовані об'єкти
-    return clients
 
 
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -218,16 +226,12 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     data = query.data
     user_id = query.from_user.id
     
-    if data.startswith('menu_key_'):
-        # 1. Початок FSM для додавання ключа
-        model_name = data.split('_')[2].replace('%20', ' ')
-        context.user_data['temp_model_name'] = model_name
-        
-        await query.edit_message_text(
-            f"Надішліть, будь ласка, Ваш API-ключ для <b>{model_name}</b>.",
-            parse_mode="HTML"
-        )
-        return WAITING_API_KEY # Переходимо до FSM
+    if data == 'menu_status':
+        # Показати статус ключів
+        status = get_key_status()
+        status_msg = get_status_message(status)
+        await query.edit_message_text(status_msg, parse_mode="HTML")
+        return ConversationHandler.END
     
     elif data == 'menu_profile':
         # Показати профіль користувача
@@ -238,16 +242,6 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # 2. Початок дебатів (Задання запитання)
         await query.edit_message_text("✍️ Надішліть, будь ласка, <b>тему для дебатів</b> (текст запитання).", parse_mode="HTML")
         # Тут не використовуємо FSM, а чекаємо на наступне текстове повідомлення
-        return ConversationHandler.END 
-        
-    elif data == 'menu_status':
-        # 3. Якщо кнопа неактивна, просто показуємо статус
-        await query.answer("Потрібно додати два API-ключі!")
-        await query.edit_message_text(
-            "🛑 Потрібно додати два API-ключі!\nВиберіть модель, щоб продовжити:",
-            reply_markup=get_main_menu_markup(user_id),
-            parse_mode="HTML"
-        )
         return ConversationHandler.END 
         
     return ConversationHandler.END
@@ -334,60 +328,6 @@ async def receive_custom_rounds(update: Update, context: ContextTypes.DEFAULT_TY
         return CHOOSING_ROUNDS
 
 
-async def receive_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обробник отримання API-ключа (FSM state)."""
-    user_id = update.effective_user.id
-    api_key = update.message.text.strip()
-    model_name = context.user_data.get('temp_model_name')
-
-    # Відповідь буде відправлена як нове повідомлення (не можна редагувати попереднє)
-    status_msg = await update.message.reply_text("Перевіряю ключ...")
-
-    try:
-        ClientCreator = AI_CLIENTS.get(model_name)
-        # Створюємо тимчасовий клієнт для валідації нового ключа
-        temp_client = ClientCreator(api_key)
-        is_valid = await temp_client.validate_key()
-
-        if is_valid:
-            # --- 1. ЗБЕРІГАННЯ В БД ---
-            is_new = DB_MANAGER.add_key(user_id, model_name, api_key)
-
-            if not is_new:
-                # Ключ вже існує, просто оновлюємо кеш
-                message_text = f"🔑 Ключ для <b>{model_name}</b> вже був доданий."
-            else:
-                message_text = f"✅ Ключ для <b>{model_name}</b> додано."
-
-            # --- 2. ОНОВЛЕННЯ КЛІЄНТІВ ---
-            # Видаляємо старий кеш, щоб build_ai_clients знову завантажив усі ключі з БД
-            cached_user_api_keys.pop(user_id, None)
-            clients_map = build_ai_clients(user_id)
-
-            # Порахувати кількість ключів для моделі
-            model_count = 0
-            if clients_map and model_name in clients_map and getattr(clients_map.get(model_name), 'api_keys', None):
-                model_count = len(clients_map.get(model_name).api_keys)
-
-            await status_msg.edit_text(
-                f"{message_text} (Всього: {model_count} ключів). Виберіть наступну дію:",
-                reply_markup=get_main_menu_markup(user_id), 
-                parse_mode="HTML"
-            )
-
-        else:
-            await status_msg.edit_text(
-                f"❌ Це не ключ для <b>{model_name}</b>. Спробуйте ще раз.",
-                parse_mode="HTML"
-            )
-            return WAITING_API_KEY
-
-    except Exception as e:
-        print(f"Критична помилка при перевірці ключа: {e}")
-        await status_msg.edit_text("Виникла непередбачена помилка. Спробуйте /start.")
-
-    context.user_data.pop('temp_model_name', None)
-    return ConversationHandler.END # Успішний вихід, якщо ключ валідний
 
 
 # --------------------------
@@ -559,17 +499,14 @@ def main_bot_setup(token: str) -> Application:
     # Ініціалізуємо Application з переданим токеном
     APPLICATION = Application.builder().token(token).build()
     
-    # ConversationHandler для FSM (введення API ключа та вибір раундів)
+    # ConversationHandler для FSM (вибір раундів)
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
             CommandHandler("rounds", choose_rounds_command),
-            CallbackQueryHandler(main_menu_callback, pattern='^menu_key_'),
+            CallbackQueryHandler(main_menu_callback, pattern='^menu_'),
         ],
         states={
-            WAITING_API_KEY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_key),
-            ],
             CHOOSING_ROUNDS: [
                 CallbackQueryHandler(rounds_callback_handler, pattern="^rounds_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_custom_rounds),
@@ -581,6 +518,8 @@ def main_bot_setup(token: str) -> Application:
     # Реєструємо всі обробники
     APPLICATION.add_handler(CommandHandler("start", start))
     APPLICATION.add_handler(CommandHandler("status", status_command))
+    APPLICATION.add_handler(CommandHandler("help", help_command))
+    APPLICATION.add_handler(CommandHandler("setup", setup_command))
     APPLICATION.add_handler(CommandHandler("profile", show_profile))
     APPLICATION.add_handler(conv_handler)
     
