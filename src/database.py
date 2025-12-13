@@ -6,10 +6,23 @@ class DatabaseManager:
     """Керує базою даних SQLite для зберігання ключів користувачів."""
     
     def __init__(self, db_name='debate_bot.db'):
-        self.conn = sqlite3.connect(db_name)
-        self.cursor = self.conn.cursor()
-        self._create_table()
-        self._create_profile_table()
+        # Тимчасово не створюємо з'єднання відразу, щоб уникнути запису файлу при імпорті
+        self.db_name = db_name
+        self.conn = None
+        self.cursor = None
+        
+        # self._connect() # <--- ТИМЧАСОВО КОМЕНТУЄМО
+        # self._create_table() # <--- ТИМЧАСОВО КОМЕНТУЄМО
+        # self._create_profile_table() # <--- ТИМЧАСОВО КОМЕНТУЄМО
+        pass
+
+    def _ensure_connected(self):
+        """Ленива ініціалізація: з'єднується та створює таблиці при першому використанні."""
+        if self.conn is None:
+            self.conn = sqlite3.connect(self.db_name)
+            self.cursor = self.conn.cursor()
+            self._create_table()
+            self._create_profile_table()
 
     def _create_table(self):
         """Створює таблицю, якщо вона ще не існує."""
@@ -40,6 +53,7 @@ class DatabaseManager:
 
     def get_user_profile(self, user_id: int, username: str) -> Tuple[float, str]:
         """Отримує баланс та дату приєднання; створює профіль, якщо його немає."""
+        self._ensure_connected()
         self.cursor.execute("SELECT balance, join_date FROM user_profiles WHERE user_id = ?", (user_id,))
         result = self.cursor.fetchone()
 
@@ -56,11 +70,13 @@ class DatabaseManager:
 
     def update_balance(self, user_id: int, amount: float):
         """Змінює баланс користувача (додає/віднімає значення)."""
+        self._ensure_connected()
         self.cursor.execute("UPDATE user_profiles SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
         self.conn.commit()
 
     def add_key(self, user_id: int, model_name: str, api_key: str) -> bool:
         """Додає новий ключ для користувача."""
+        self._ensure_connected()
         try:
             self.cursor.execute("""
                 INSERT OR IGNORE INTO api_keys (user_id, model_name, api_key) 
@@ -75,6 +91,7 @@ class DatabaseManager:
 
     def get_keys_by_user(self, user_id: int) -> Dict[str, List[str]]:
         """Завантажує всі ключі для користувача, згруповані за моделлю."""
+        self._ensure_connected()
         self.cursor.execute("""
             SELECT model_name, api_key FROM api_keys WHERE user_id = ?
         """, (user_id,))
