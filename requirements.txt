@@ -1,8 +1,8 @@
-python-telegram-bot
+python-telegram-bot==21.9
 python-dotenv
-google.generativeai
+google-generativeai
 groq
-psycopg2-binary
 anthropic
-httpx
+psycopg2-binary
 cryptography
+httpx
