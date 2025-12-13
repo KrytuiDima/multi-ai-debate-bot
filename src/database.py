@@ -65,6 +65,20 @@ class DatabaseManager:
         if not self.using_postgres:
             print("Using SQLite (debate_bot.db) for local development")
     
+    def _execute_query(self, conn, sql: str, params: tuple = ()):
+        """Виконує запит з автоматичною конвертацією параметрів для SQLite/PostgreSQL."""
+        cursor = conn.cursor()
+        
+        # Конвертуємо %s на ? для SQLite
+        if not self.using_postgres:
+            sql = sql.replace('%s', '?')
+        
+        if params:
+            cursor.execute(sql, params)
+        else:
+            cursor.execute(sql)
+        return cursor
+    
     def _connect(self):
         """Встановлює з'єднання з PostgreSQL або SQLite."""
         if self.using_postgres:
@@ -80,7 +94,9 @@ class DatabaseManager:
                 raise
         else:
             # SQLite (локальна розробка)
-            return sqlite3.connect(self.db_file, check_same_thread=False)
+            conn = sqlite3.connect(self.db_file, check_same_thread=False)
+            conn.row_factory = sqlite3.Row  # Enable column access by name
+            return conn
 
     def _create_tables(self):
         """Створює необхідні таблиці (PostgreSQL або SQLite синтаксис)."""
@@ -318,26 +334,30 @@ class DatabaseManager:
         conn = None
         try:
             conn = self._connect()
-            cursor = conn.cursor()
             
-            cursor.execute("SELECT balance, join_date FROM user_profiles WHERE user_id = %s", (user_id,))
+            cursor = self._execute_query(conn, 
+                "SELECT balance, join_date FROM user_profiles WHERE user_id = ?", 
+                (user_id,))
             result = cursor.fetchone()
             
             if result:
                 balance, join_date = result
                 return float(balance), str(join_date)
             else:
-                cursor.execute("""
-                    INSERT INTO user_profiles (user_id, username)
-                    VALUES (%s, %s)
-                    RETURNING balance, join_date;
-                """, (user_id, username))
+                self._execute_query(conn, 
+                    "INSERT INTO user_profiles (user_id, username) VALUES (?, ?)",
+                    (user_id, username))
                 conn.commit()
+                
+                # Fetch the created record
+                cursor = self._execute_query(conn,
+                    "SELECT balance, join_date FROM user_profiles WHERE user_id = ?",
+                    (user_id,))
                 balance, join_date = cursor.fetchone()
                 return float(balance), str(join_date)
                 
         except Exception as e:
-            print(f"Помилка отримання/створення профілю: {e}")
+            print(f"Error getting/creating profile: {e}")
             return 0.0, "N/A"
         finally:
             if conn:
