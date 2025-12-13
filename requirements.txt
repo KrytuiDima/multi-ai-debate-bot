@@ -2,6 +2,4 @@ python-telegram-bot
 python-dotenv
 google-genai
 groq
-fastapi
-uvicorn
-requests
+psycopg2-binary
