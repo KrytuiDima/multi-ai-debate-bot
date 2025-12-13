@@ -1,5 +1,6 @@
 # src/database.py
 import psycopg2
+import sqlite3
 import os
 from typing import Tuple, List, Dict, Optional
 from dotenv import load_dotenv
@@ -56,70 +57,110 @@ def decrypt_key(encrypted_key: str) -> str:
 
 class DatabaseManager:
     def __init__(self):
-        # Отримуємо рядок підключення з Vercel/оточення
+        # Отримуємо рядок підключення з Railway/оточення
         self.db_url = os.getenv("DATABASE_URL")
-        if not self.db_url:
-            print("WARNING: DATABASE_URL не знайдено. БД функціонуватиме тільки з точкою входу Vercel.")
+        self.using_postgres = bool(self.db_url)
+        self.db_file = "debate_bot.db"
+        
+        if not self.using_postgres:
+            print("Using SQLite (debate_bot.db) for local development")
     
     def _connect(self):
-        """Встановлює з'єднання з PostgreSQL з явним SSL."""
-        if not self.db_url:
-            raise Exception("DATABASE_URL не встановлено.")
-        
-        # Neon вимагає SSL. Додаємо ці параметри у рядок підключення.
-        # Створюємо словник параметрів
-        params = {
-            'dsn': self.db_url,  # dsn - Data Source Name
-            'sslmode': 'require'  # Явно вимагаємо SSL
-        }
-        
-        return psycopg2.connect(**params)  # Передаємо словник параметрів
+        """Встановлює з'єднання з PostgreSQL або SQLite."""
+        if self.using_postgres:
+            # PostgreSQL (Neon на Railway)
+            try:
+                params = {
+                    'dsn': self.db_url,
+                    'sslmode': 'require'
+                }
+                return psycopg2.connect(**params)
+            except Exception as e:
+                print(f"Error connecting to PostgreSQL: {e}")
+                raise
+        else:
+            # SQLite (локальна розробка)
+            return sqlite3.connect(self.db_file, check_same_thread=False)
 
     def _create_tables(self):
-        """Створює необхідні таблиці (використовуємо синтаксис PostgreSQL)."""
+        """Створює необхідні таблиці (PostgreSQL або SQLite синтаксис)."""
         conn = None
         try:
             conn = self._connect()
             cursor = conn.cursor()
             
-            # Таблиця 1: API-ключі користувачів
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS api_keys (
-                    user_id BIGINT NOT NULL,
-                    ai_service TEXT NOT NULL,
-                    api_key TEXT NOT NULL,
-                    PRIMARY KEY (user_id, ai_service)
-                );
-            """)
+            if self.using_postgres:
+                # PostgreSQL таблиці
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS api_keys (
+                        user_id BIGINT NOT NULL,
+                        ai_service TEXT NOT NULL,
+                        api_key TEXT NOT NULL,
+                        PRIMARY KEY (user_id, ai_service)
+                    );
+                """)
 
-            # Таблиця 2: Профілі користувачів та баланс
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS user_profiles (
-                    user_id BIGINT PRIMARY KEY,
-                    username TEXT,
-                    balance NUMERIC(10, 2) DEFAULT 0.00,
-                    join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    active_key_id INTEGER DEFAULT NULL
-                );
-            """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_profiles (
+                        user_id BIGINT PRIMARY KEY,
+                        username TEXT,
+                        balance NUMERIC(10, 2) DEFAULT 0.00,
+                        join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        active_key_id INTEGER DEFAULT NULL
+                    );
+                """)
 
-            # Таблиця 3: API-ключі користувачів (нова)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS user_api_keys (
-                    id SERIAL PRIMARY KEY,
-                    owner_id BIGINT NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
-                    api_key TEXT NOT NULL,
-                    service VARCHAR(50) NOT NULL,
-                    calls_remaining INTEGER DEFAULT 1000,
-                    is_active BOOLEAN DEFAULT TRUE,
-                    alias VARCHAR(100),
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(owner_id, alias)
-                );
-            """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_api_keys (
+                        id SERIAL PRIMARY KEY,
+                        owner_id BIGINT NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
+                        api_key TEXT NOT NULL,
+                        service VARCHAR(50) NOT NULL,
+                        calls_remaining INTEGER DEFAULT 1000,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        alias VARCHAR(100),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(owner_id, alias)
+                    );
+                """)
+            else:
+                # SQLite таблиці
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS api_keys (
+                        user_id INTEGER NOT NULL,
+                        ai_service TEXT NOT NULL,
+                        api_key TEXT NOT NULL,
+                        PRIMARY KEY (user_id, ai_service)
+                    );
+                """)
+
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_profiles (
+                        user_id INTEGER PRIMARY KEY,
+                        username TEXT,
+                        balance REAL DEFAULT 0.00,
+                        join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        active_key_id INTEGER DEFAULT NULL
+                    );
+                """)
+
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_api_keys (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        owner_id INTEGER NOT NULL,
+                        api_key TEXT NOT NULL,
+                        service VARCHAR(50) NOT NULL,
+                        calls_remaining INTEGER DEFAULT 1000,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        alias VARCHAR(100),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(owner_id, alias),
+                        FOREIGN KEY(owner_id) REFERENCES user_profiles(user_id) ON DELETE CASCADE
+                    );
+                """)
 
             conn.commit()
-            print("Таблиці успішно створені/перевірені.")
+            print("Tables created successfully")
         except Exception as e:
             print(f"Помилка створення таблиць: {e}")
         finally:
