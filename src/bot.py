@@ -20,7 +20,7 @@ from telegram.ext import (
     ConversationHandler
 )
 
-from ai_clients import BaseAI, AI_CLIENTS 
+from ai_clients import BaseAI, AI_CLIENTS, AI_CLIENTS_MAP 
 from debate_manager import DebateSession, DebateStatus
 from database import DB_MANAGER  # Імпортуємо глобальний об'єкт
 
@@ -32,12 +32,21 @@ APPLICATION = None # Тут буде зберігатися об'єкт Applicat
 # --- КІНЕЦЬ НОВИХ ЗМІН ---
 
 # --- СТАНИ FSM ---
-# FSM використовується для ОДНОГО завдання: отримання API ключа
-WAITING_API_KEY = 1
-CHOOSING_ROUNDS = 2
+CHOOSING_ROUNDS = 1
+AWAITING_SERVICE = 2
+AWAITING_KEY = 3
+AWAITING_ALIAS = 4
 
 # Раунди, які пропонуємо
 ROUND_OPTIONS = [2, 3, 5, 10]
+
+# Сервіси для додавання ключів
+AVAILABLE_SERVICES = {
+    'gemini': 'Gemini (Google)',
+    'groq': 'Llama3 (Groq)',
+    'claude': 'Claude (Anthropic)',
+    'deepseek': 'DeepSeek'
+}
 
 # --- ФУНКЦІЇ ПЕРЕВІРКИ КЛЮЧІВ ---
 
@@ -179,6 +188,181 @@ async def setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "DEEPSEEK_API_KEY=your_deepseek_key</code>"
     )
     await update.message.reply_text(setup_text, parse_mode="HTML")
+
+
+# --- КОМАНДА /addkey ---
+
+async def addkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Початок діалогу для додавання нового API-ключа."""
+    keyboard = []
+    for service_key, service_name in AVAILABLE_SERVICES.items():
+        keyboard.append([InlineKeyboardButton(service_name, callback_data=f"service_{service_key}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "<b>🔑 Оберіть сервіс для додавання ключа:</b>",
+        reply_markup=reply_markup,
+        parse_mode="HTML"
+    )
+    
+    return AWAITING_SERVICE
+
+
+async def service_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обробляє вибір сервісу."""
+    query = update.callback_query
+    await query.answer()
+    
+    service_key = query.data.split('_')[1]
+    service_name = AVAILABLE_SERVICES.get(service_key)
+    
+    context.user_data['service_key'] = service_key
+    context.user_data['service_name'] = service_name
+    
+    await query.edit_message_text(
+        f"Введіть ваш API-ключ для <b>{service_name}</b>:\n"
+        f"(Ключ буде зашифрований і безпечно збережено в базі)",
+        parse_mode="HTML"
+    )
+    
+    return AWAITING_KEY
+
+
+async def receive_api_key_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Отримує введений API-ключ."""
+    api_key = update.message.text.strip()
+    
+    if len(api_key) < 10:
+        await update.message.reply_text(
+            "❌ Ключ занадто короткий. Будь ласка, введіть коректний API-ключ."
+        )
+        return AWAITING_KEY
+    
+    context.user_data['api_key'] = api_key
+    
+    await update.message.reply_text(
+        "<b>Як назвати цей ключ?</b>\n"
+        "Наприклад: <code>Gemini Personal</code>, <code>Claude Work</code>, тощо",
+        parse_mode="HTML"
+    )
+    
+    return AWAITING_ALIAS
+
+
+async def receive_alias_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Отримує введену назву (alias) ключа."""
+    alias = update.message.text.strip()
+    
+    if len(alias) < 3 or len(alias) > 100:
+        await update.message.reply_text(
+            "❌ Назва має бути від 3 до 100 символів. Спробуйте ще раз.",
+            parse_mode="HTML"
+        )
+        return AWAITING_ALIAS
+    
+    # Зберігаємо ключ у БД
+    user_id = update.effective_user.id
+    api_key = context.user_data.get('api_key')
+    service_key = context.user_data.get('service_key')
+    service_name = context.user_data.get('service_name')
+    
+    try:
+        success = DB_MANAGER.add_api_key(user_id, service_key, api_key, alias)
+        
+        if success:
+            await update.message.reply_text(
+                f"✅ <b>Ключ для {service_name} успішно додано!</b>\n\n"
+                f"📝 <b>Деталі:</b>\n"
+                f"Назва: <code>{alias}</code>\n"
+                f"Сервіс: {service_name}\n\n"
+                f"Використовуйте /mykeys щоб переглянути та вибрати ключі.",
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text(
+                f"⚠️ Ключ з назвою <code>{alias}</code> вже існує.\n"
+                f"Будь ласка, використовуйте іншу назву.",
+                parse_mode="HTML"
+            )
+            return AWAITING_ALIAS
+    except Exception as e:
+        print(f"Помилка при додаванні ключа: {e}")
+        await update.message.reply_text(
+            "❌ Виникла помилка при додаванні ключа. Спробуйте пізніше."
+        )
+    
+    # Очищуємо користувацькі дані
+    context.user_data.pop('service_key', None)
+    context.user_data.pop('service_name', None)
+    context.user_data.pop('api_key', None)
+    
+    return ConversationHandler.END
+
+
+# --- КОМАНДА /mykeys ---
+
+async def mykeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Відображає список ключів користувача та дозволяє вибрати активний."""
+    user_id = update.effective_user.id
+    
+    try:
+        keys = DB_MANAGER.get_user_api_keys(user_id)
+        
+        if not keys:
+            keyboard = [[InlineKeyboardButton("➕ Додати ключ", url=f"https://t.me/{context.bot.username}?start=addkey")]]
+            await update.message.reply_text(
+                "📭 У вас немає збережених API-ключів.\n\n"
+                "Використовуйте /addkey щоб додати новий ключ.",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="HTML"
+            )
+            return
+        
+        # Формуємо список ключів з кнопками
+        text = "Key list:\n\n"
+        keyboard = []
+        
+        active_key_id = DB_MANAGER.get_active_key_id(user_id)
+        
+        for key_info in keys:
+            # key_info is a dict with: id, alias, service, calls_remaining, is_active
+            key_id = key_info.get('id')
+            alias = key_info.get('alias')
+            service = key_info.get('service')
+            calls_remaining = key_info.get('calls_remaining')
+            
+            # Вибираємо емодзі в залежності від сервісу
+            service_emoji = {
+                'gemini': '(G)',
+                'groq': '(Q)',
+                'claude': '(C)',
+                'deepseek': '(D)'
+            }.get(service, '(?)')
+            
+            status_icon = "[A]" if key_id == active_key_id else "[ ]"
+            
+            text += f"{status_icon} {service_emoji} {alias}\n"
+            text += f"   Calls: {calls_remaining}\n\n"
+            
+            # Кнопка для вибору ключа
+            button_text = f"[A] {alias}" if key_id == active_key_id else f"[ ] {alias}"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"select_key_{key_id}")])
+        
+        # Кнопка для додавання нового ключа
+        keyboard.append([InlineKeyboardButton("[+] Add key", callback_data="add_new_key")])
+        
+        await update.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        print(f"Помилка при отриманні списку ключів: {e}")
+        await update.message.reply_text(
+            "❌ Виникла помилка при завантаженні ключів. Спробуйте пізніше."
+        )
 
 
 def build_ai_clients(user_id: int) -> Optional[Dict[str, BaseAI]]:
@@ -343,8 +527,13 @@ async def delete_previous_debate_messages(chat_id: int, context: ContextTypes.DE
         except Exception:
             pass # Ігноруємо помилки, якщо повідомлення вже видалено
 
-async def run_debate_round(session: DebateSession, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def run_debate_round(session: DebateSession, chat_id: int, context: ContextTypes.DEFAULT_TYPE, user_id: int = None, client_key_mapping: Dict = None):
     """Виконує один раунд дебатів, оновлюючи UI."""
+    
+    if user_id is None:
+        user_id = context.user_data.get('current_user_id')
+    if client_key_mapping is None:
+        client_key_mapping = context.user_data.get('client_key_mapping', {})
     
     # Очищуємо попередні повідомлення
     await delete_previous_debate_messages(chat_id, context)
@@ -363,13 +552,23 @@ async def run_debate_round(session: DebateSession, chat_id: int, context: Contex
     # 2. Запускаємо раунд асинхронно
     round_results = await session.run_next_round()
     
-    # 3. Фінальне оновлення статусу
+    # 3. Відстежуємо виконані запити та зменшуємо лімітів
+    if user_id and client_key_mapping:
+        for client_name in round_results.keys():
+            key_id = client_key_mapping.get(client_name)
+            if key_id:
+                try:
+                    DB_MANAGER.decrement_calls(key_id, user_id)
+                except Exception as e:
+                    print(f"Помилка при зменшенні запитів для {client_name}: {e}")
+    
+    # 4. Фінальне оновлення статусу
     await status_msg.edit_text(
         f"✅ <b>РАУНД {session.round} ЗАВЕРШЕНО</b> ✅", 
         parse_mode="HTML"
     )
 
-    # 4. Відправка відповідей окремими повідомленнями
+    # 5. Відправка відповідей окремими повідомленнями
     for name, response in round_results.items():
         msg = await context.bot.send_message(
             chat_id, 
@@ -402,25 +601,113 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if topic.startswith('/') or not topic:
         return
 
-    # 2. Перевірка наявності клієнтів (мінімум 2)
-    clients = user_clients.get(user_id, {})
-    if len(clients) < 2:
+    # 2. Завантажуємо ключі користувача з БД
+    try:
+        user_keys = DB_MANAGER.get_user_api_keys(user_id)
+        
+        if not user_keys:
+            await update.message.reply_text(
+                "🔑 Потрібно додати API-ключі. Використовуйте /addkey щоб додати ключ."
+            )
+            return
+        
+        # 3. Ініціалізуємо AI клієнти з активними ключами
+        active_key_id = DB_MANAGER.get_active_key_id(user_id)
+        
+        if not active_key_id:
+            await update.message.reply_text(
+                "⚠️ Оберіть активний ключ за допомогою /mykeys"
+            )
+            return
+        
+        clients = {}
+        client_key_mapping = {}  # Mappings: client_name -> key_id
+        
+        for key_info in user_keys:
+            # key_info is a dict with: id, alias, service, calls_remaining, is_active
+            key_id = key_info.get('id')
+            alias = key_info.get('alias')
+            service = key_info.get('service')
+            calls_remaining = key_info.get('calls_remaining')
+            
+            # Пропускаємо ключі без запитів
+            if calls_remaining <= 0:
+                continue
+            
+            # Отримуємо розшифрований ключ
+            decrypted_key, service_name = DB_MANAGER.get_api_key_decrypted(key_id, user_id)
+            
+            if decrypted_key and service_name in AI_CLIENTS_MAP:
+                try:
+                    # Ініціалізуємо клієнт з ключем
+                    ClientClass = AI_CLIENTS_MAP[service_name]
+                    client = ClientClass(decrypted_key)
+                    clients[alias] = client
+                    client_key_mapping[alias] = key_id  # Зберігаємо mapping
+                except Exception as e:
+                    print(f"Помилка при ініціалізації {service_name}: {e}")
+        
+        if len(clients) < 1:
+            await update.message.reply_text(
+                "❌ Немає доступних ключів з запитами. Перевірте /mykeys"
+            )
+            return
+        
+    except Exception as e:
+        print(f"Помилка при завантаженні ключів: {e}")
         await update.message.reply_text(
-            "🛑 Потрібно додати принаймні два робочих API-ключі. Використовуйте /start."
+            "❌ Виникла помилка при завантаженні ключів. Спробуйте пізніше."
         )
         return
 
-    # 3. Ігноруємо, якщо вже йдуть дебати
+    # 4. Ігноруємо, якщо вже йдуть дебати
     if user_id in active_sessions:
         await update.message.reply_text("Будь ласка, дочекайтеся завершення поточних дебатів.")
         return
 
-    # 4. Ініціалізація сесії (фіксуємо 3 раунди, як просили)
+    # 5. Ініціалізація сесії 
     session = DebateSession(topic=topic, clients_map=clients, max_rounds=3)
     active_sessions[user_id] = session
     
-    # 5. Одразу запускаємо перший раунд
-    await run_debate_round(session, chat_id, context)
+    # Зберігаємо користувача та mapping для відстеження запитів
+    context.user_data['current_user_id'] = user_id
+    context.user_data['client_key_mapping'] = client_key_mapping
+    
+    # 6. Одразу запускаємо перший раунд
+    await run_debate_round(session, chat_id, context, user_id, client_key_mapping)
+
+
+
+
+async def key_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробник вибору активного ключа з /mykeys."""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    if query.data == 'add_new_key':
+        # Переходимо до /addkey команди
+        await query.edit_message_text("Перенаправляємо до додавання нового ключа...")
+        await addkey_command(update, context)
+        return
+    
+    if query.data.startswith('select_key_'):
+        key_id = int(query.data.split('_')[2])
+        
+        try:
+            # Встановлюємо активний ключ
+            success = DB_MANAGER.set_active_key(user_id, key_id)
+            
+            if success:
+                await query.answer("✅ Ключ обраний!", show_alert=False)
+                # Оновлюємо список ключів
+                await mykeys_command(query, context)
+            else:
+                await query.answer("❌ Не вдалось обрати ключ!", show_alert=True)
+        except Exception as e:
+            print(f"Помилка при виборі ключа: {e}")
+            await query.answer("❌ Помилка при обранні ключа!", show_alert=True)
 
 
 async def handle_debate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -440,7 +727,7 @@ async def handle_debate_callback(update: Update, context: ContextTypes.DEFAULT_T
     if query.data == 'debate_next_round':
         # Якщо сесія ще не завершена, запускаємо наступний раунд
         await query.edit_message_text(f"Запускаємо <b>Раунд {session.round + 1}</b>...", parse_mode="HTML")
-        await run_debate_round(session, chat_id, context)
+        await run_debate_round(session, chat_id, context, user_id)
         
     elif query.data == 'debate_final_result':
         # 1. Очищуємо екран
@@ -499,17 +786,27 @@ def main_bot_setup(token: str) -> Application:
     # Ініціалізуємо Application з переданим токеном
     APPLICATION = Application.builder().token(token).build()
     
-    # ConversationHandler для FSM (вибір раундів)
+    # ConversationHandler для FSM (вибір раундів та додавання ключів)
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
             CommandHandler("rounds", choose_rounds_command),
+            CommandHandler("addkey", addkey_command),
             CallbackQueryHandler(main_menu_callback, pattern='^menu_'),
         ],
         states={
             CHOOSING_ROUNDS: [
                 CallbackQueryHandler(rounds_callback_handler, pattern="^rounds_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_custom_rounds),
+            ],
+            AWAITING_SERVICE: [
+                CallbackQueryHandler(service_callback, pattern="^service_"),
+            ],
+            AWAITING_KEY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_key_input),
+            ],
+            AWAITING_ALIAS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_alias_input),
             ],
         },
         fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
@@ -521,10 +818,15 @@ def main_bot_setup(token: str) -> Application:
     APPLICATION.add_handler(CommandHandler("help", help_command))
     APPLICATION.add_handler(CommandHandler("setup", setup_command))
     APPLICATION.add_handler(CommandHandler("profile", show_profile))
+    APPLICATION.add_handler(CommandHandler("mykeys", mykeys_command))
+    APPLICATION.add_handler(CommandHandler("addkey", addkey_command))
     APPLICATION.add_handler(conv_handler)
     
     # Хендлер для кнопок головного меню, які не ведуть у FSM
     APPLICATION.add_handler(CallbackQueryHandler(main_menu_callback, pattern='^menu_'))
+    
+    # Хендлер для вибору ключа з /mykeys
+    APPLICATION.add_handler(CallbackQueryHandler(key_selection_callback, pattern='^select_key_|^add_new_key'))
     
     # Хендлер для кнопок управління дебатами
     APPLICATION.add_handler(CallbackQueryHandler(handle_debate_callback, pattern='^debate_'))

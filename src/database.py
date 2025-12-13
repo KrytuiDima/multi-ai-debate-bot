@@ -1,11 +1,58 @@
 # src/database.py
 import psycopg2
 import os
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 from dotenv import load_dotenv
+from cryptography.fernet import Fernet
+import base64
+import hashlib
 
-# Завантажуємо .env локально, хоча на Vercel це робить платформа
+# Завантажуємо .env локально, хоча на Railway це робить платформа
 load_dotenv()
+
+# --- ФУНКЦІЇ ШИФРУВАННЯ ---
+
+def get_encryption_key() -> bytes:
+    """Отримує або генерує ключ шифрування з ENCRYPTION_KEY змінної середовища."""
+    key_string = os.getenv('ENCRYPTION_KEY')
+    if not key_string:
+        raise ValueError("ENCRYPTION_KEY не встановлено у змінних середовища")
+    
+    # Переконуємось, що ключ має правильний формат для Fernet (32 байти, base64 encoded = 44 символи)
+    if len(key_string) == 44:
+        # Це вже правильно закодований ключ
+        try:
+            return key_string.encode() if isinstance(key_string, str) else key_string
+        except Exception:
+            pass
+    
+    # Якщо це довгий рядок або невідомий формат, хешуємо його і кодуємо
+    key_bytes = hashlib.sha256(key_string.encode()).digest()  # 32 байти
+    key = base64.urlsafe_b64encode(key_bytes)  # 44 символи
+    return key
+
+def encrypt_key(api_key: str) -> str:
+    """Шифрує API-ключ."""
+    try:
+        key = get_encryption_key()
+        cipher = Fernet(key)
+        encrypted = cipher.encrypt(api_key.encode())
+        return encrypted.decode()
+    except Exception as e:
+        print(f"Помилка при шифруванні ключа: {e}")
+        raise
+
+def decrypt_key(encrypted_key: str) -> str:
+    """Розшифровує API-ключ."""
+    try:
+        key = get_encryption_key()
+        cipher = Fernet(key)
+        decrypted = cipher.decrypt(encrypted_key.encode())
+        return decrypted.decode()
+    except Exception as e:
+        print(f"Помилка при розшифруванні ключа: {e}")
+        raise
+
 
 class DatabaseManager:
     def __init__(self):
@@ -51,7 +98,23 @@ class DatabaseManager:
                     user_id BIGINT PRIMARY KEY,
                     username TEXT,
                     balance NUMERIC(10, 2) DEFAULT 0.00,
-                    join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    active_key_id INTEGER DEFAULT NULL
+                );
+            """)
+
+            # Таблиця 3: API-ключі користувачів (нова)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_api_keys (
+                    id SERIAL PRIMARY KEY,
+                    owner_id BIGINT NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
+                    api_key TEXT NOT NULL,
+                    service VARCHAR(50) NOT NULL,
+                    calls_remaining INTEGER DEFAULT 1000,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    alias VARCHAR(100),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(owner_id, alias)
                 );
             """)
 
@@ -59,6 +122,152 @@ class DatabaseManager:
             print("Таблиці успішно створені/перевірені.")
         except Exception as e:
             print(f"Помилка створення таблиць: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+    def add_api_key(self, owner_id: int, service: str, api_key: str, alias: str) -> bool:
+        """Додає новий зашифрований API-ключ."""
+        conn = None
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+            
+            encrypted_key = encrypt_key(api_key)
+            
+            cursor.execute("""
+                INSERT INTO user_api_keys (owner_id, api_key, service, alias)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (owner_id, alias) DO NOTHING;
+            """, (owner_id, encrypted_key, service, alias))
+            
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Помилка додавання API ключа: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def get_user_api_keys(self, user_id: int) -> List[Dict]:
+        """Отримує всі ключи користувача."""
+        conn = None
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT id, alias, service, calls_remaining, is_active 
+                FROM user_api_keys 
+                WHERE owner_id = %s
+                ORDER BY created_at DESC;
+            """, (user_id,))
+            
+            results = []
+            for row in cursor.fetchall():
+                results.append({
+                    'id': row[0],
+                    'alias': row[1],
+                    'service': row[2],
+                    'calls_remaining': row[3],
+                    'is_active': row[4]
+                })
+            return results
+        except Exception as e:
+            print(f"Помилка отримання ключів: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def get_api_key_decrypted(self, key_id: int, user_id: int) -> Optional[Tuple[str, str]]:
+        """Отримує розшифрований ключ та сервіс за ID."""
+        conn = None
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT api_key, service 
+                FROM user_api_keys 
+                WHERE id = %s AND owner_id = %s;
+            """, (key_id, user_id))
+            
+            row = cursor.fetchone()
+            if row:
+                decrypted_key = decrypt_key(row[0])
+                return decrypted_key, row[1]
+            return None
+        except Exception as e:
+            print(f"Помилка отримання розшифрованого ключа: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def decrement_calls(self, key_id: int, user_id: int) -> bool:
+        """Зменшує кількість залишків запитів на 1."""
+        conn = None
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                UPDATE user_api_keys 
+                SET calls_remaining = calls_remaining - 1 
+                WHERE id = %s AND owner_id = %s;
+            """, (key_id, user_id))
+            
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Помилка зменшення запитів: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def set_active_key(self, user_id: int, key_id: int) -> bool:
+        """Встановлює активний ключ для користувача."""
+        conn = None
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                UPDATE user_profiles 
+                SET active_key_id = %s 
+                WHERE user_id = %s;
+            """, (key_id, user_id))
+            
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Помилка встановлення активного ключа: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def get_active_key_id(self, user_id: int) -> Optional[int]:
+        """Отримує ID активного ключа користувача."""
+        conn = None
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT active_key_id 
+                FROM user_profiles 
+                WHERE user_id = %s;
+            """, (user_id,))
+            
+            row = cursor.fetchone()
+            return row[0] if row else None
+        except Exception as e:
+            print(f"Помилка отримання активного ключа: {e}")
+            return None
         finally:
             if conn:
                 conn.close()

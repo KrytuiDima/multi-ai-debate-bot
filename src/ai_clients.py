@@ -35,11 +35,9 @@ class BaseAI(abc.ABC):
 # --- КЛІЄНТИ ---
 
 class GroqClient(BaseAI):
-    def __init__(self):
+    def __init__(self, api_key: str):
         super().__init__('Llama3 (Groq)')
-        self.api_key = os.getenv('GROQ_API_KEY')
-        if not self.api_key:
-            raise ValueError("GROQ_API_KEY не встановлено у змінних середовища")
+        self.api_key = api_key
     
     async def validate_key(self) -> bool:
         """Перевірка ключа Groq."""
@@ -80,11 +78,9 @@ class GroqClient(BaseAI):
 
 
 class GeminiClient(BaseAI):
-    def __init__(self):
+    def __init__(self, api_key: str):
         super().__init__('Gemini')
-        self.api_key = os.getenv('GEMINI_API_KEY')
-        if not self.api_key:
-            raise ValueError("GEMINI_API_KEY не встановлено у змінних середовища")
+        self.api_key = api_key
     
     async def validate_key(self) -> bool:
         """Перевірка ключа Gemini."""
@@ -117,11 +113,8 @@ class GeminiClient(BaseAI):
 
 class ClaudeAI(BaseAI):
     """Обгортка для моделі Anthropic Claude."""
-    def __init__(self):
+    def __init__(self, api_key: str):
         super().__init__("Claude")
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY не встановлено у змінних середовища")
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model_name = "claude-3-haiku-20240307"
 
@@ -160,11 +153,9 @@ class ClaudeAI(BaseAI):
 
 class DeepSeekAI(BaseAI):
     """Обгортка для моделі DeepSeek."""
-    def __init__(self):
+    def __init__(self, api_key: str):
         super().__init__("DeepSeek")
-        self.api_key = os.getenv("DEEPSEEK_API_KEY")
-        if not self.api_key:
-            raise ValueError("DEEPSEEK_API_KEY не встановлено у змінних середовища")
+        self.api_key = api_key
         self.url = "https://api.deepseek.com/chat/completions"
         self.model_name = "deepseek-chat"
 
@@ -221,9 +212,13 @@ class DeepSeekAI(BaseAI):
 
 
 # Словник для зручного вибору класів
-AI_CLIENTS: Dict[str, BaseAI] = {
-    'Llama3 (Groq)': GroqClient(),
-    'Gemini': GeminiClient(),
-    'Claude': ClaudeAI(),
-    'DeepSeek': DeepSeekAI(),
+# Примітка: Клієнти тепер ініціалізуються з API-ключами під час використання
+AI_CLIENTS_MAP = {
+    'groq': GroqClient,
+    'gemini': GeminiClient,
+    'claude': ClaudeAI,
+    'deepseek': DeepSeekAI,
 }
+
+# Для сумісності, зберігаємо стару назву (але тепер це словник класів)
+AI_CLIENTS = AI_CLIENTS_MAP

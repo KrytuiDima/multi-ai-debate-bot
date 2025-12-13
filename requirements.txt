@@ -5,3 +5,4 @@ groq
 psycopg2-binary
 anthropic
 httpx
+cryptography
