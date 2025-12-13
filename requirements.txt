@@ -4,4 +4,5 @@ google-genai
 groq
 fastapi
 uvicorn
-requests
+requests 
+psycopg2-binary
