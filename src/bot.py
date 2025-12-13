@@ -22,7 +22,6 @@ from telegram.ext import (
 
 from ai_clients import BaseAI, AI_CLIENTS 
 from debate_manager import DebateSession, DebateStatus
-from database import DB_MANAGER  # Імпортуємо глобальний об'єкт
 
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -98,14 +97,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 def build_ai_clients(user_id: int) -> Optional[Dict[str, BaseAI]]:
     """Ініціалізує об'єкти клієнтів на основі списку збережених ключів (з БД)."""
 
-    # 1. Спробувати отримати ключі з кешу
+    # 1. Спробувати отримати ключи з кешу
     keys_map = cached_user_api_keys.get(user_id)
-
-    # 2. Якщо ключів немає в кеші, завантажити їх з бази даних
-    if not keys_map:
-        keys_map = DB_MANAGER.get_keys_by_user(user_id)
-        if keys_map:
-            cached_user_api_keys[user_id] = keys_map
 
     if not keys_map or len(keys_map) < 2:
         return None
@@ -147,8 +140,8 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return WAITING_API_KEY # Переходимо до FSM
     
     elif data == 'menu_profile':
-        # Показати профіль користувача
-        await show_profile(update, context)
+        # Профіль показувати не можемо без БД
+        await query.answer("Профіль тимчасово недоступний")
         return ConversationHandler.END
         
     elif data == 'menu_ask':
@@ -170,29 +163,7 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
-async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показує профіль користувача: баланс, ім'я та дату реєстрації."""
-    # Визначаємо user_id та username у випадку команди або callback
-    if update.callback_query:
-        user = update.callback_query.from_user
-    else:
-        user = update.effective_user
 
-    user_id = user.id
-    username = user.username or "Н/Д"
-
-    balance, join_date = DB_MANAGER.get_user_profile(user_id, username)
-
-    message = (
-        "👤 <b>Ваш Профіль</b>\n\n"
-        f"ID користувача: <code>{user_id}</code>\n"
-        f"Ім'я користувача: @{username}\n"
-        f"📅 Дата реєстрації: {join_date}\n\n"
-        f"💰 <b>Баланс:</b> {balance:.2f} ₴"
-    )
-
-    # Відправляємо приватне повідомлення користувачу
-    await context.bot.send_message(user_id, message, parse_mode="HTML")
 
 async def receive_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обробник отримання API-ключа (FSM state)."""
@@ -210,14 +181,15 @@ async def receive_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         is_valid = await temp_client.validate_key()
 
         if is_valid:
-            # --- 1. ЗБЕРІГАННЯ В БД ---
-            is_new = DB_MANAGER.add_key(user_id, model_name, api_key)
-
-            if not is_new:
-                # Ключ вже існує, просто оновлюємо кеш
-                message_text = f"🔑 Ключ для <b>{model_name}</b> вже був доданий."
-            else:
-                message_text = f"✅ Ключ для <b>{model_name}</b> додано."
+            # Зберігаємо ключ тільки в оперативній пам'яті (кеш)
+            if user_id not in cached_user_api_keys:
+                cached_user_api_keys[user_id] = {}
+            
+            if model_name not in cached_user_api_keys[user_id]:
+                cached_user_api_keys[user_id][model_name] = []
+            
+            cached_user_api_keys[user_id][model_name].append(api_key)
+            message_text = f"✅ Ключ для <b>{model_name}</b> додано."
 
             # --- 2. ОНОВЛЕННЯ КЛІЄНТІВ ---
             # Видаляємо старий кеш, щоб build_ai_clients знову завантажив усі ключі з БД
@@ -413,9 +385,6 @@ def main_bot_setup(token: str) -> Application:
     if APPLICATION is not None:
         return APPLICATION
     
-    # 1. Створюємо таблиці БД при першому запуску
-    DB_MANAGER._create_tables()
-    
     # Ініціалізуємо Application з переданим токеном
     APPLICATION = Application.builder().token(token).build()
     
@@ -435,7 +404,6 @@ def main_bot_setup(token: str) -> Application:
     
     # Реєструємо всі обробники
     APPLICATION.add_handler(CommandHandler("start", start))
-    APPLICATION.add_handler(CommandHandler("profile", show_profile))
     APPLICATION.add_handler(conv_handler)
     
     # Хендлер для кнопок головного меню, які не ведуть у FSM
