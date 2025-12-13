@@ -15,10 +15,18 @@ class DatabaseManager:
             print("WARNING: DATABASE_URL не знайдено. БД функціонуватиме тільки з точкою входу Vercel.")
     
     def _connect(self):
-        """Встановлює з'єднання з PostgreSQL."""
+        """Встановлює з'єднання з PostgreSQL з явним SSL."""
         if not self.db_url:
             raise Exception("DATABASE_URL не встановлено.")
-        return psycopg2.connect(self.db_url)
+        
+        # Neon вимагає SSL. Додаємо ці параметри у рядок підключення.
+        # Створюємо словник параметрів
+        params = {
+            'dsn': self.db_url,  # dsn - Data Source Name
+            'sslmode': 'require'  # Явно вимагаємо SSL
+        }
+        
+        return psycopg2.connect(**params)  # Передаємо словник параметрів
 
     def _create_tables(self):
         """Створює необхідні таблиці (використовуємо синтаксис PostgreSQL)."""
