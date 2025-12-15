@@ -5,31 +5,27 @@ import asyncio
 import os
 import anthropic
 import httpx
-import logging # ВИПРАВЛЕННЯ: Додано logging
+import logging # Додано logging
 from groq import AsyncGroq, APIError as GroqAPIError
 
 # Додаємо логування
 logger = logging.getLogger(__name__)
 
-# --- ВИПРАВЛЕННЯ: УМОВНИЙ ІМПОРТ GOOGLE GEMINI ТА ПОМИЛОК ---
+# --- Імпорти Google Gemini ---
 try:
-    # Намагаємося імпортувати основний SDK
     import google.generativeai as genai
-    
-    # Вирішення проблеми: Намагаємося імпортувати помилку, але якщо Pylance не знаходить, створюємо заглушку
+    # ВИПРАВЛЕННЯ: Умовний імпорт помилки з fallback для Pylance
     try:
-        from google.generativeai.errors import APIError as GeminiAPIError # type: ignore
+        from google.generativeai.errors import APIError as GeminiAPIError
     except ImportError:
-        # Це клас-заглушка, який Pylance знайде і це вирішить помилку "could not be resolved"
+        # Створюємо клас-заглушку, якщо модуль errors не знайдено
         class GeminiAPIError(Exception):
             pass
-            
 except ImportError:
     genai = None
     # Створюємо заглушку, якщо бібліотека Gemini недоступна
     class GeminiAPIError(Exception):
         pass
-# --- КІНЕЦЬ ВИПРАВЛЕННЯ ІМПОРТІВ GEMINI ---
 
 
 # Визначення моделей для зручності
@@ -44,11 +40,10 @@ MODELS_MAP = {
 
 class BaseAI(abc.ABC):
     """Абстрактний базовий клас для всіх AI-клієнтів"""
-    def __init__(self, model_name: str, api_key: str): 
-        # Використовуємо MODELS_MAP для отримання фактичного ID моделі
-        self.model_name = MODELS_MAP.get(model_name, model_name) 
+    def __init__(self, model_name: str, api_key: str): # Додаємо api_key до конструктора для уніфікації
+        self.model_name = MODELS_MAP.get(model_name, model_name) # Використовуємо ID моделі
         self.model_map_key = model_name
-        self.api_key = api_key 
+        self.api_key = api_key # Зберігаємо ключ тут
 
     @abc.abstractmethod
     async def validate_key(self) -> bool:
@@ -64,19 +59,20 @@ class BaseAI(abc.ABC):
 
 class GroqClient(BaseAI):
     def __init__(self, api_key: str):
+        # Передаємо ключ у BaseAI
         super().__init__('Llama3 (Groq)', api_key=api_key) 
         self.client = AsyncGroq(api_key=self.api_key)
     
     async def validate_key(self) -> bool:
         """Перевірка ключа Groq."""
         try:
+            # Спроба отримати список моделей як мінімальна перевірка
             await self.client.models.list() 
             return True
         except GroqAPIError:
             logger.error("Groq validation failed due to API Error.")
             return False
         except Exception:
-            logger.error("Groq validation failed due to unknown error.")
             return False
 
     async def generate_response(self, system_prompt: str, debate_history: str, topic: str) -> str:
@@ -90,7 +86,7 @@ class GroqClient(BaseAI):
         
         try:
             response = await self.client.chat.completions.create(
-                model=self.model_name,
+                model=self.model_name, 
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content}
@@ -98,7 +94,8 @@ class GroqClient(BaseAI):
             )
             return response.choices[0].message.content
         except GroqAPIError as e:
-            logger.error(f"Groq generation failed: {e}")
+            # Повертаємо помилку, щоб її обробив бот
+            logger.error(f"Groq generation failed: {e.code}")
             return f"Помилка генерації (GroqAPIError: {e.code}). Перевірте, чи модель {self.model_name} не застаріла."
         except Exception as e:
             logger.error(f"Groq generation failed (Unknown): {e}")
@@ -107,30 +104,25 @@ class GroqClient(BaseAI):
 
 class GeminiClient(BaseAI):
     def __init__(self, api_key: str):
+        # Передаємо ключ у BaseAI
         super().__init__('Gemini', api_key=api_key) 
     
     async def validate_key(self) -> bool:
         """Перевірка ключа Gemini."""
         try:
-            if not genai:
-                raise ImportError("Google GenAI SDK is not installed.")
-                
             genai.configure(api_key=self.api_key)
             model = genai.GenerativeModel(self.model_name)
+            # Використовуємо generate_content_async для асинхронності
             await model.generate_content_async("ping") 
             return True
-        except GeminiAPIError as e: # ВИПРАВЛЕННЯ: Тепер Pylance знає про GeminiAPIError
-            logger.error(f"Gemini validation failed (API Error): {e}")
+        except GeminiAPIError: # Використовуємо GeminiAPIError
+            logger.error("Gemini validation failed due to API Error.")
             return False
-        except Exception as e:
-            logger.error(f"Gemini validation failed (Unknown): {e}")
+        except Exception:
             return False
 
     async def generate_response(self, system_prompt: str, debate_history: str, topic: str) -> str:
         """Генерація відповіді для Gemini."""
-        if not genai:
-             return "Помилка: Gemini SDK не встановлено."
-             
         genai.configure(api_key=self.api_key)
         model = genai.GenerativeModel(self.model_name)
         
@@ -142,13 +134,14 @@ class GeminiClient(BaseAI):
         )
         
         try:
+            # Використовуємо generate_content_async для коректної роботи
             response = await model.generate_content_async(full_prompt) 
             return response.text
-        except GeminiAPIError as e: # ВИПРАВЛЕННЯ: Тепер Pylance знає про GeminiAPIError
+        except GeminiAPIError as e: # Використовуємо GeminiAPIError
             logger.error(f"Gemini generation failed (API Error): {e}")
             return f"Помилка генерації (Gemini API Error): {e}"
         except Exception as e:
-            logger.error(f"Помилка генерації (Gemini Error): {e}")
+            logger.error(f"Gemini generation failed (Unknown): {e}")
             return f"Помилка генерації (Gemini Error): {e}"
 
 
@@ -157,21 +150,21 @@ class ClaudeAI(BaseAI):
     def __init__(self, api_key: str):
         super().__init__("Claude", api_key=api_key)
         self.client = anthropic.AsyncAnthropic(api_key=self.api_key) 
-        
+
     async def validate_key(self) -> bool:
         """Перевірка ключа Claude."""
         try:
+            # Використовуємо асинхронну версію
             await self.client.messages.create( 
                 model=self.model_name,
                 max_tokens=10,
                 messages=[{"role": "user", "content": "ping"}]
             )
             return True
-        except anthropic.APIError as e:
-            logger.error(f"Claude validation failed (API Error): {e}")
+        except anthropic.APIError: # Catch specific API Error
+            logger.error("Claude validation failed due to API Error.")
             return False
-        except Exception as e:
-            logger.error(f"Claude validation failed (Unknown): {e}")
+        except Exception:
             return False
 
     async def generate_response(self, system_prompt: str, debate_history: str, topic: str) -> str:
@@ -183,6 +176,7 @@ class ClaudeAI(BaseAI):
         )
         
         try:
+            # Використовуємо асинхронну версію
             message = await self.client.messages.create( 
                 model=self.model_name,
                 max_tokens=2048,
@@ -203,7 +197,7 @@ class DeepSeekAI(BaseAI):
     def __init__(self, api_key: str):
         super().__init__("DeepSeek", api_key=api_key)
         self.url = "https://api.deepseek.com/chat/completions"
-        
+
     async def validate_key(self) -> bool:
         """Перевірка ключа DeepSeek."""
         headers = {
@@ -217,6 +211,7 @@ class DeepSeekAI(BaseAI):
         }
         
         try:
+            # httpx.AsyncClient для асинхронних запитів
             async with httpx.AsyncClient() as client: 
                 response = await client.post(self.url, headers=headers, json=data, timeout=10.0)
                 response.raise_for_status()
@@ -266,3 +261,8 @@ AI_CLIENTS_MAP: Dict[str, Type[BaseAI]] = {
     'claude': ClaudeAI,
     'deepseek': DeepSeekAI,
 }
+
+# ВИПРАВЛЕННЯ: Додавання змінних, які імпортує bot.py
+MODEL_NAME_TO_ID = MODELS_MAP
+AVAILABLE_SERVICES = list(AI_CLIENTS_MAP.keys())
+AVAILABLE_MODELS = list(MODELS_MAP.keys())
