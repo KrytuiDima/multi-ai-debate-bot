@@ -2,9 +2,12 @@
 import asyncio
 import os
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Type
+import sys
+import time
+import socket
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error
 from telegram.ext import (
     Application, 
     CommandHandler, 
@@ -15,12 +18,13 @@ from telegram.ext import (
     ConversationHandler
 )
 
-# Виправляємо імпорт: AI_CLIENTS_MAP має бути доступним
-from ai_clients import BaseAI, AI_CLIENTS_MAP 
+# Виправляємо імпорти: додано AVAILABLE_MODELS
+from ai_clients import BaseAI, AI_CLIENTS_MAP, MODEL_NAME_TO_ID, AVAILABLE_SERVICES, AVAILABLE_MODELS
 from debate_manager import DebateSession, DebateStatus
 from database import DB_MANAGER, decrypt_key 
 from dotenv import load_dotenv
 
+# Завантаження змінних середовища
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
@@ -32,618 +36,652 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- СТАНИ FSM ---
-CHOOSING_ROUNDS = 1
-AWAITING_SERVICE = 2
-AWAITING_KEY = 3
-AWAITING_ALIAS = 4
-AWAITING_LIMIT = 5 
+# Для /addkey
+AWAITING_SERVICE = 1
+AWAITING_KEY = 2
+AWAITING_ALIAS = 3
+AWAITING_LIMIT = 4 
+
+# Для /debate
 AWAITING_DEBATE_TOPIC = 10
 AWAITING_DEBATE_ROUNDS = 11
 AWAITING_DEBATE_AI1 = 12
 AWAITING_DEBATE_AI2 = 13
 
+# Максимальна кількість раундів для вибору
+DEBATE_ROUNDS = [3, 5, 7]
 
-# --- ГЛОБАЛЬНІ КОНСТАНТИ ---
-AVAILABLE_SERVICES: Dict[str, str] = {
-    'groq': 'Groq (Llama 3)',
-    'gemini': 'Gemini (Flash)',
-    'claude': 'Claude (Haiku)',
-    'deepseek': 'DeepSeek',
-}
+# --- КОРИСНІ ФУНКЦІЇ ---
 
-# --- ДОПОМІЖНІ ФУНКЦІЇ ---
+async def delete_previous_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Видаляє повідомлення, яке викликало колбек, якщо це можливо."""
+    try:
+        if update.callback_query and update.effective_message:
+            await update.effective_message.delete()
+    except Exception as e:
+        logger.warning(f"Не вдалося видалити повідомлення: {e}")
 
-def get_main_menu(user_id: int) -> InlineKeyboardMarkup:
-    """Генерує головне меню залежно від наявності ключів."""
-    user_keys = DB_MANAGER.get_user_keys_with_alias(user_id)
-    
-    if user_keys:
-        buttons = [
-            [InlineKeyboardButton("⚔️ Розпочати Дебати", callback_data='cmd_debate')],
-            [InlineKeyboardButton("➕ Додати API ключ", callback_data='cmd_addkey')],
-            [InlineKeyboardButton("🔑 Мої Ключі", callback_data='cmd_mykeys')],
-            [InlineKeyboardButton("❓ Допомога", callback_data='cmd_help')],
-        ]
-    else:
-        buttons = [
-            [InlineKeyboardButton("➕ Додати API ключ", callback_data='cmd_addkey')],
-            [InlineKeyboardButton("❓ Допомога", callback_data='cmd_help')],
-        ]
-        
-    return InlineKeyboardMarkup(buttons)
+# --- КОМАНДИ МЕНЮ ---
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробляє команду /start."""
     user = update.effective_user
-    DB_MANAGER.register_user(user.id, user.username or '', user.first_name or '')
-    
-    welcome_message = (
-        f"👋 Вітаємо, **{user.first_name}**!\n\n"
-        "Я - **AI Debate Bot**. Я влаштовую дебати між двома різними AI-моделями на будь-яку тему.\n\n"
-        "Для початку роботи, вам потрібно додати свої API ключі (BYOK - Bring Your Own Key) від Groq, Gemini, Claude або DeepSeek.\n\n"
-        "Оберіть дію нижче:"
+    text = (
+        f"👋 Вітаю, {user.full_name}!\n\n"
+        "Я — ваш персональний AI-дебатер. Я можу організувати дебати між двома різними AI-моделями на будь-яку тему.\n\n"
+        "Для використання потрібно додати свої API-ключі. Використовуйте:\n"
+        "🔹 /addkey - для додавання нового API-ключа.\n"
+        "🔹 /mykeys - для перегляду та видалення ваших ключів.\n"
+        "🔹 /debate - для початку нових дебатів."
     )
-    
-    await update.message.reply_text(
-        welcome_message,
-        reply_markup=get_main_menu(user.id),
-        parse_mode='Markdown'
+    await update.message.reply_text(text)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробляє команду /help."""
+    text = (
+        "**🤖 Команди AI-дебатера:**\n"
+        "🔹 /start - Почати роботу та отримати вітання.\n"
+        "🔹 /help - Показати цю довідку.\n"
+        "🔹 /addkey - Додати новий API-ключ для Groq, Gemini, DeepSeek або Claude.\n"
+        "🔹 /mykeys - Переглянути ваші збережені ключі та їхні ліміти. Можна видалити ключ.\n"
+        "🔹 /debate - Розпочати нові дебати між двома обраними AI-моделями (за вашими ключами).\n"
+        "\n_Важливо: Ваші ключі зберігаються у зашифрованому вигляді._"
     )
-    return ConversationHandler.END
+    await update.message.reply_text(text, parse_mode='Markdown')
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обробляє команду /cancel і завершує розмову."""
-    user_id = update.effective_user.id
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробляє команду /history (замість неї покажемо поточний статус дебатів)."""
+    # Перевіряємо, чи є активна сесія дебатів
+    session: Optional[DebateSession] = context.chat_data.get('debate_session')
     
-    # Визначаємо, звідки прийшов запит (команда чи callback)
-    if update.callback_query:
-        await update.callback_query.answer()
-        message = update.callback_query.message
-    else:
-        message = update.message
-        
-    await message.reply_text(
-        'Скасовано. Повертаємось до головного меню.',
-        reply_markup=get_main_menu(user_id)
+    if not session:
+        await update.message.reply_text("Наразі немає активних дебатів. Спробуйте /debate.")
+        return
+
+    # Показуємо останній раунд та загальний статус
+    text = (
+        f"**📊 Активні дебати:**\n"
+        f"Тема: _{session.topic}_\n"
+        f"Раунд: **{session.round}/{session.MAX_ROUNDS}**\n"
+        f"AI 1: `{list(session.clients.keys())[0]}` vs AI 2: `{list(session.clients.keys())[1]}`\n\n"
     )
-    # Очищуємо тимчасові дані
-    context.user_data.pop('new_key_service', None)
-    context.user_data.pop('new_key_value', None)
-    context.user_data.pop('new_key_limit', None)
-    context.user_data.pop('current_debate_session', None)
-    return ConversationHandler.END
-
-
-# --- 1. ЛОГІКА ДОДАВАННЯ КЛЮЧІВ (BYOK) ---
-
-async def addkey_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Початок розмови для додавання ключа."""
     
     keyboard = []
-    for code, name in AVAILABLE_SERVICES.items():
-        keyboard.append([InlineKeyboardButton(name, callback_data=f'srv_{code}')])
-    
-    # Визначаємо, звідки прийшов запит (команда чи callback)
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
-            "Оберіть AI сервіс, ключ якого ви хочете додати:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+    if session.is_running:
+        text += f"Поточний статус: {DebateStatus.THINKING.value}\n"
+        # Не додаємо кнопку, бо бот працює
+    elif session.round > 0 and session.round < session.MAX_ROUNDS:
+        text += f"Поточний статус: Очікування наступного раунду.\n"
+        keyboard.append([InlineKeyboardButton("Продовжити раунд", callback_data='run_round')])
+    elif session.round == session.MAX_ROUNDS:
+        text += f"Поточний статус: {DebateStatus.FINISHED.value}\n"
     else:
-        await update.message.reply_text(
-            "Оберіть AI сервіс, ключ якого ви хочете додати:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    return AWAITING_SERVICE
+        text += f"Поточний статус: Очікування початку (Раунд 1).\n"
+        keyboard.append([InlineKeyboardButton("Розпочати раунд 1", callback_data='run_round')])
 
-async def addkey_service_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обробка вибору сервісу."""
-    query = update.callback_query
-    await query.answer()
-    srv_code = query.data.split('_')[1]
-    context.user_data['new_key_service'] = srv_code
-    
-    # Визначаємо, як має виглядати ключ для підказки користувачеві
-    key_prefix = ""
-    if srv_code == 'groq':
-        key_prefix = "gsk_..."
-    elif srv_code == 'claude':
-        key_prefix = "sk-ant-api03-..."
-    elif srv_code == 'gemini':
-        key_prefix = "AIzaSy..."
-    elif srv_code == 'deepseek':
-        key_prefix = "sk-..."
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
 
-    await query.edit_message_text(
-        f"Введіть API ключ для **{AVAILABLE_SERVICES[srv_code]}**.\n"
-        f"Він має починатися з `{key_prefix}`",
+
+# --- FSM: ДОДАВАННЯ КЛЮЧА /ADDKEY ---
+
+async def addkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Починає розмову для додавання ключа."""
+    keyboard = []
+    for service in AVAILABLE_SERVICES:
+        keyboard.append([InlineKeyboardButton(service, callback_data=f'service_{service}')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "**🔑 Який сервіс ви хочете додати?**", 
+        reply_markup=reply_markup,
         parse_mode='Markdown'
     )
+    return AWAITING_SERVICE
+
+async def receive_service_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Приймає вибір сервісу."""
+    query = update.callback_query
+    await query.answer()
+    
+    service_name = query.data.split('_')[1]
+    context.user_data['temp_service'] = service_name
+    await delete_previous_message(update, context)
+
+    await query.edit_message_text(
+        f"**🔗 Ви обрали: {service_name}.**\n"
+        f"Тепер, будь ласка, **надішліть ваш API-ключ** для {service_name}."
+        f"\n\n_Ви можете скасувати, надіславши команду /cancel_"
+    , parse_mode='Markdown')
     return AWAITING_KEY
 
-async def addkey_receive_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обробка введеного ключа та синтаксична валідація."""
-    key = update.message.text.strip()
-    service = context.user_data.get('new_key_service')
+async def receive_api_key_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Приймає API-ключ та починає його валідацію."""
+    api_key = update.message.text.strip()
+    service_name = context.user_data['temp_service']
     
-    # 1. Валідація синтаксису ключа
-    is_valid_syntax = False
-    if service == 'groq' and key.startswith('gsk_'):
-        is_valid_syntax = True
-    elif service == 'claude' and key.startswith('sk-ant-api03-'):
-        is_valid_syntax = True
-    elif service == 'gemini' and key.startswith('AIzaSy'):
-        is_valid_syntax = True
-    elif service == 'deepseek' and key.startswith('sk-'):
-        is_valid_syntax = True
+    await update.message.reply_text(f"⏳ Перевіряю ключ для {service_name}...")
     
-    if not is_valid_syntax:
+    # 1. Спроба створити клієнта
+    try:
+        # Для валідації беремо першу доступну модель для цього сервісу
+        # AVAILABLE_MODELS тепер імпортовано
+        model_name_key = AVAILABLE_MODELS.get(service_name, [None])[0]
+        model_name = MODEL_NAME_TO_ID.get(model_name_key)
+        
+        if not model_name:
+            await update.message.reply_text("Помилка: Не знайдено моделі для цього сервісу.")
+            return ConversationHandler.END
+
+        AIClientClass: Type[BaseAI] = AI_CLIENTS_MAP[service_name]
+        client = AIClientClass(model_name=model_name, api_key=api_key)
+    except Exception as e:
+        await update.message.reply_text(f"Помилка ініціалізації клієнта: {e}")
+        return AWAITING_KEY # Повторити спробу
+
+    # 2. Асинхронна валідація ключа
+    try:
+        is_valid = await client.validate_key()
+    except Exception as e:
+        logger.error(f"Помилка під час валідації ключа {service_name}: {e}")
+        is_valid = False
+
+    if is_valid:
+        context.user_data['temp_api_key'] = api_key
+        context.user_data['temp_model_name'] = model_name_key
         await update.message.reply_text(
-            f"❌ Це не схоже на ключ для **{AVAILABLE_SERVICES.get(service)}**.\n"
-            f"Перевірте, чи ви обрали правильний сервіс або чи правильно скопіювали ключ.",
-            parse_mode='Markdown'
+            f"✅ **Ключ для {service_name} успішно перевірено!**\n"
+            f"Обрана модель: _{model_name_key} ({model_name})_\n\n"
+            "Тепер, будь ласка, **надішліть унікальний аліас** (наприклад, `MyGroqKey` або `FastClaude`)."
+        , parse_mode='Markdown')
+        return AWAITING_ALIAS
+    else:
+        await update.message.reply_text(
+            f"❌ **Помилка валідації ключа для {service_name}.**\n"
+            "Перевірте ключ і спробуйте ще раз. Можливо, він недійсний або вичерпано ліміт."
         )
         return AWAITING_KEY
 
-    context.user_data['new_key_value'] = key
-    
-    # ПЕРЕХІД ДО ВВЕДЕННЯ ЛІМІТУ
-    return await addkey_receive_limit(update, context, is_initial=True) 
+async def receive_alias_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Приймає аліас."""
+    alias = update.message.text.strip()
+    context.user_data['temp_alias'] = alias
 
-async def addkey_receive_limit(update: Update, context: ContextTypes.DEFAULT_TYPE, is_initial: bool = False) -> int:
-    """Обробка ліміту запитів."""
-    service = context.user_data.get('new_key_service')
-    
-    # Інформація про безкоштовні ліміти (для підказки)
-    limit_info = {
-        'groq': "Groq: Ліміт залежить від токенів (близько 131k/день). Рекомендований стартовий ліміт: **2000**.",
-        'gemini': "Gemini: Free Tier API - до **1000** запитів на день (залежить від моделі).",
-        'claude': "Claude: Free Tier API ліміти гнучкі та часто змінюються. Рекомендований стартовий ліміт: **100**.",
-        'deepseek': "DeepSeek: API формально без ліміту, але для Free Tier Web - 10 запитів/день. Рекомендований стартовий ліміт: **10**.",
-    }
-    
-    info = limit_info.get(service, "Точний безкоштовний ліміт невідомий. Рекомендовано 1000.")
-    
-    if not is_initial:
-        # Обробка введеного користувачем ліміту
-        try:
-            limit = int(update.message.text.strip())
-            if limit < 0: raise ValueError
-        except ValueError:
-            await update.message.reply_text("Будь ласка, введіть коректне число (більше або дорівнює 0) для ліміту.")
-            return AWAITING_LIMIT
-        
-        context.user_data['new_key_limit'] = limit
-        await update.message.reply_text("Введіть назву (alias) для цього ключа (напр. 'Мій Groq'):")
-        return AWAITING_ALIAS
-    else:
-        # Перший вхід у стан: просимо ліміт
-        # Визначаємо, яке повідомлення редагувати
-        
-        # Якщо перехід після отримання ключа (відповідь на message), то надсилаємо нове message
-        await update.message.reply_text(
-            f"**Введіть місячний ліміт запитів** для ключа **{AVAILABLE_SERVICES[service]}**.\n"
-            f"*{info}*\n\n"
-            f"Наприклад, 1000 (або 0, якщо ліміту немає/невідомо)."
-            f"\n\n**(Пам'ятайте, один раунд дебатів = 2 запити)**",
-            parse_mode='Markdown'
-        )
+    await update.message.reply_text(
+        f"**🤖 Аліас '{alias}' встановлено.**\n\n"
+        "І останнє: **встановіть ліміт викликів** (наприклад, 100). Це захист від випадкового вичерпання лімітів."
+        "\n_Введіть ціле число (0 для безліміту)._"
+    , parse_mode='Markdown')
+    return AWAITING_LIMIT
+
+
+async def receive_limit_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Приймає ліміт та зберігає ключ у БД."""
+    try:
+        calls_limit = int(update.message.text.strip())
+        if calls_limit < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Будь ласка, введіть коректне ціле число (0 або більше).")
         return AWAITING_LIMIT
 
-async def addkey_receive_alias(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обробка псевдоніма ключа та збереження в БД."""
-    alias = update.message.text.strip()
     user_id = update.effective_user.id
-    
-    key = context.user_data['new_key_value']
-    service = context.user_data['new_key_service']
-    limit = context.user_data.get('new_key_limit', 0) 
+    service_name = context.user_data['temp_service']
+    api_key = context.user_data['temp_api_key']
+    alias = context.user_data['temp_alias']
 
-    # Перевірка на унікальність псевдоніма
-    if DB_MANAGER.get_key_details_by_alias(user_id, alias):
-        await update.message.reply_text("❌ Ключ з такою назвою (alias) вже існує. Спробуйте іншу назву.")
-        return AWAITING_ALIAS
-
-    success = DB_MANAGER.add_api_key(
-        owner_id=user_id, 
-        service=service, 
-        api_key=key, 
+    # Зберігаємо у БД
+    success = DB_MANAGER.add_new_key(
+        user_id=user_id,
+        ai_service=service_name,
+        api_key=api_key,
         alias=alias,
-        calls_remaining=limit
+        calls_limit=calls_limit
     )
-    
+
     if success:
-        await update.message.reply_text(f"✅ Ключ **'{alias}'** ({AVAILABLE_SERVICES[service]}) додано з лімітом **{limit}** запитів!", parse_mode='Markdown', reply_markup=get_main_menu(user_id))
+        limit_text = "Безлімітно" if calls_limit == 0 else f"{calls_limit} запитів"
+        await update.message.reply_text(
+            f"**🎉 Ключ '{alias}' ({service_name}) успішно додано!**\n"
+            f"Ліміт: {limit_text}. Поточних: {calls_limit}."
+        , parse_mode='Markdown')
     else:
-        await update.message.reply_text("❌ Помилка. Не вдалося додати ключ. Можливо, назва ключа вже існує. Спробуйте іншу назву.", reply_markup=get_main_menu(user_id))
+        await update.message.reply_text(
+            f"❌ **Помилка збереження ключа.**\n"
+            "Можливо, ви вже маєте ключ з таким аліасом для цього сервісу. Спробуйте інший аліас або /mykeys."
+        )
+
+    # Очищуємо дані сесії
+    context.user_data.pop('temp_service', None)
+    context.user_data.pop('temp_api_key', None)
+    context.user_data.pop('temp_alias', None)
+    context.user_data.pop('temp_model_name', None)
     
-    context.user_data.clear()
     return ConversationHandler.END
 
-# --- 2. ЛОГІКА ДЕБАТІВ ---
+# --- КОМАНДА ПЕРЕГЛЯДУ КЛЮЧІВ /MYKEYS ---
 
-def get_key_keyboard(user_id: int, prefix: str) -> InlineKeyboardMarkup:
-    """Генерує клавіатуру з ключами користувача, включаючи залишок запитів."""
-    keys = DB_MANAGER.get_user_keys_with_alias(user_id)
+async def mykeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показує всі збережені ключі користувача."""
+    user_id = update.effective_user.id
+    keys = DB_MANAGER.get_keys_by_user(user_id) # (key_id, service, key, alias, limit, remaining)
+
+    if not keys:
+        await update.message.reply_text(
+            "У вас поки немає доданих API-ключів. Використовуйте /addkey, щоб додати перший."
+        )
+        return
+
+    text = "**🔑 Ваші збережені API-ключі:**\n\n"
     keyboard = []
     
-    for alias, service, remaining, key_id in keys:
-        # Додаємо умову: показуємо ключ, лише якщо залишився хоча б 1 запит
-        if remaining > 0:
-            display_name = f"{alias} ({AVAILABLE_SERVICES[service]}) [ {remaining} ]"
-            keyboard.append([InlineKeyboardButton(display_name, callback_data=f'{prefix}_{alias}')])
+    for key_id, service, _, alias, calls_limit, calls_remaining in keys:
+        limit_display = "Безліміт" if calls_limit == 0 else str(calls_limit)
         
-    return InlineKeyboardMarkup(keyboard)
-
-async def debate_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Початок розмови для дебатів."""
-    user_id = update.effective_user.id
-    keys = DB_MANAGER.get_user_keys_with_alias(user_id)
-    
-    # Визначаємо, звідки прийшов запит для коректної відповіді
-    if update.callback_query:
-        await update.callback_query.answer()
-        message = update.callback_query.message
-    else:
-        message = update.message
-
-    if len(keys) < 2:
-        await message.reply_text(
-            "❌ У вас має бути додано мінімум два API ключі для проведення дебатів. Будь ласка, додайте ще ключі.",
-            reply_markup=get_main_menu(user_id)
+        # Перевірка статусу ліміту
+        status = ""
+        if calls_limit > 0 and calls_remaining <= 0:
+            status = " (❌ ВИЧЕРПАНО)"
+        elif calls_limit > 0 and calls_remaining < calls_limit * 0.1:
+            status = " (⚠️ НИЗЬКИЙ ЛІМІТ)"
+            
+        text += (
+            f"**{alias}** ({service})\n"
+            f"   - Ліміт: {limit_display}\n"
+            f"   - Залишок: **{calls_remaining}**{status}\n"
+            f"   - ID: `{key_id}`\n---\n"
         )
-        return ConversationHandler.END
+        
+        keyboard.append([
+            InlineKeyboardButton(f"Видалити {alias} (ID: {key_id})", callback_data=f'deletekey_{key_id}')
+        ])
 
-    await message.reply_text(
-        "Введіть тему, на яку будуть дебатувати AI (напр. 'Чи повинна влада регулювати ШІ?'):"
-    )
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def delete_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробляє видалення ключа."""
+    query = update.callback_query
+    await query.answer()
     
+    key_id = int(query.data.split('_')[1])
+    user_id = update.effective_user.id
+
+    success = DB_MANAGER.delete_key(user_id, key_id)
+
+    if success:
+        # Видаляємо старе повідомлення або редагуємо, щоб уникнути помилки "Message is not modified"
+        try:
+             await query.edit_message_text(f"✅ Ключ ID `{key_id}` успішно видалено.", parse_mode='Markdown')
+        except error.BadRequest:
+             # Якщо повідомлення вже змінено, просто ігноруємо
+             pass
+        # Оновлюємо список
+        await mykeys_command(update, context) 
+    else:
+        await query.edit_message_text(f"❌ Помилка видалення ключа ID `{key_id}`. Можливо, він вже був видалений.")
+
+
+# --- FSM: ДЕБАТИ /DEBATE ---
+
+async def debate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Починає процес налаштування дебатів - введення теми."""
+    
+    # Скидаємо будь-яку стару сесію
+    if context.chat_data.get('debate_session'):
+        context.chat_data.pop('debate_session')
+
+    await update.message.reply_text(
+        "**💬 Починаємо налаштування дебатів!**\n\n"
+        "**1. Введіть тему дебатів** (наприклад, _'Чи потрібен безумовний базовий дохід?'_)."
+        "\n\n_Ви можете скасувати, надіславши команду /cancel_"
+    , parse_mode='Markdown')
     return AWAITING_DEBATE_TOPIC
 
 async def debate_topic_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обробка отриманої теми та запит на кількість раундів."""
-    context.user_data['debate_topic'] = update.message.text.strip()
+    """Приймає тему та просить обрати кількість раундів."""
+    context.chat_data['debate_topic'] = update.message.text.strip()
     
-    keyboard = [[InlineKeyboardButton(str(r), callback_data=f'rounds_{r}')] for r in [3, 5, 7]]
-    
+    keyboard = []
+    for rounds in DEBATE_ROUNDS:
+        keyboard.append([InlineKeyboardButton(f"{rounds} раундів", callback_data=f'rounds_{rounds}')])
+        
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     await update.message.reply_text(
-        "Оберіть кількість раундів для дебатів (кожен раунд = 2 запити до API):",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        f"**Тема:** _{context.chat_data['debate_topic']}_\n\n"
+        "**2. Скільки раундів** триватимуть дебати?",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
     )
     return AWAITING_DEBATE_ROUNDS
 
 async def debate_rounds_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обробка вибору раундів та запит на першого AI."""
+    """Приймає кількість раундів та просить обрати AI 1."""
     query = update.callback_query
     await query.answer()
     
-    rounds = int(query.data.split('_')[1])
-    context.user_data['debate_rounds'] = rounds
+    context.chat_data['debate_rounds'] = int(query.data.split('_')[1])
+    await delete_previous_message(update, context)
+
+    user_id = update.effective_user.id
+    keys = DB_MANAGER.get_keys_by_user(user_id) # (key_id, service, key, alias, limit, remaining)
+
+    if len(keys) < 2:
+        await query.edit_message_text(
+            "❌ **У вас недостатньо ключів.** Для дебатів потрібно **мінімум два** активних ключі.\n"
+            f"Зараз у вас: {len(keys)}. Використовуйте /addkey, щоб додати більше."
+        , parse_mode='Markdown')
+        return ConversationHandler.END
+
+    context.chat_data['available_keys'] = keys
     
-    keyboard = get_key_keyboard(update.effective_user.id, 'ai1')
-    if not keyboard.inline_keyboard:
-         await query.edit_message_text(
-            "❌ Немає доступних ключів із достатнім лімітом запитів (мінімум 1).",
-            reply_markup=get_main_menu(update.effective_user.id)
-        )
-         return ConversationHandler.END
+    keyboard = []
+    for key_id, service, _, alias, calls_limit, calls_remaining in keys:
+        limit_needed = context.chat_data['debate_rounds']
+        status = f"({calls_remaining}/{calls_limit or '∞'})"
+        if calls_limit > 0 and calls_remaining < limit_needed:
+            status = f"⚠️ ЛІМІТ НИЗЬКИЙ ({calls_remaining}/{limit_needed})"
+        
+        keyboard.append([
+            InlineKeyboardButton(f"{alias} ({service}) {status}", callback_data=f'ai1_{key_id}')
+        ])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
     await query.edit_message_text(
-        "Оберіть **AI 1** (перший учасник):",
-        reply_markup=keyboard,
+        f"**Тема:** _{context.chat_data['debate_topic']}_\n"
+        f"**Раундів:** {context.chat_data['debate_rounds']}\n\n"
+        "**3. Оберіть AI 1** (Захисник).",
+        reply_markup=reply_markup,
         parse_mode='Markdown'
     )
     return AWAITING_DEBATE_AI1
 
 async def debate_ai1_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обробка вибору AI 1 та запит на другого AI."""
+    """Приймає вибір AI 1 та просить обрати AI 2."""
     query = update.callback_query
     await query.answer()
     
-    alias1 = query.data.split('_')[1]
-    context.user_data['debate_ai1_alias'] = alias1
+    ai1_key_id = int(query.data.split('_')[1])
+    context.chat_data['ai1_key_id'] = ai1_key_id
     
-    # Фільтруємо клавіатуру, щоб не пропонувати той самий AI і перевіряємо ліміт
-    keys = DB_MANAGER.get_user_keys_with_alias(update.effective_user.id)
-    keyboard = []
-    for alias, service, remaining, key_id in keys:
-        if alias != alias1 and remaining > 0:
-            display_name = f"{alias} ({AVAILABLE_SERVICES[service]}) [ {remaining} ]"
-            keyboard.append([InlineKeyboardButton(display_name, callback_data=f'ai2_{alias}')])
-            
-    final_keyboard = InlineKeyboardMarkup(keyboard)
+    # Видаляємо вже обраний ключ зі списку доступних для AI 2
+    keys = context.chat_data['available_keys']
+    ai2_choices = [key for key in keys if key[0] != ai1_key_id]
+    
+    ai1_data = next(key for key in keys if key[0] == ai1_key_id)
+    ai1_alias = ai1_data[3]
 
-    if not final_keyboard.inline_keyboard:
-         await query.edit_message_text(
-            f"❌ Ви обрали **{alias1}** як AI 1, але не залишилося інших ключів із достатнім лімітом запитів (мінімум 1) для AI 2.",
-            reply_markup=get_main_menu(update.effective_user.id),
-            parse_mode='Markdown'
-        )
-         return ConversationHandler.END
+    keyboard = []
+    for key_id, service, _, alias, calls_limit, calls_remaining in ai2_choices:
+        limit_needed = context.chat_data['debate_rounds']
+        status = f"({calls_remaining}/{calls_limit or '∞'})"
+        if calls_limit > 0 and calls_remaining < limit_needed:
+            status = f"⚠️ ЛІМІТ НИЗЬКИЙ ({calls_remaining}/{limit_needed})"
+        
+        keyboard.append([
+            InlineKeyboardButton(f"{alias} ({service}) {status}", callback_data=f'ai2_{key_id}')
+        ])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
     await query.edit_message_text(
-        f"✅ Ви обрали **{alias1}** як AI 1.\n\n"
-        f"Оберіть **AI 2** (другий учасник):",
-        reply_markup=final_keyboard,
+        f"**AI 1 (Захисник):** _{ai1_alias}_\n"
+        "**4. Оберіть AI 2** (Опонент).",
+        reply_markup=reply_markup,
         parse_mode='Markdown'
     )
     return AWAITING_DEBATE_AI2
 
 async def debate_ai2_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обробка вибору AI 2 та старт дебатів."""
+    """Приймає вибір AI 2, створює сесію дебатів та запускає перший раунд."""
     query = update.callback_query
     await query.answer()
+
+    ai2_key_id = int(query.data.split('_')[1])
+    context.chat_data['ai2_key_id'] = ai2_key_id
     
-    context.user_data['debate_ai2_alias'] = query.data.split('_')[1]
+    await delete_previous_message(update, context)
 
-    # Використовуємо edit_message_text, оскільки ми в callback'і
-    await query.edit_message_text("⏳ Ініціалізація дебатів...")
+    # 1. Збір та перевірка даних
+    topic = context.chat_data['debate_topic']
+    max_rounds = context.chat_data['debate_rounds']
+    keys = context.chat_data['available_keys'] # (key_id, service, key, alias, limit, remaining)
     
-    # Викликаємо функцію, яка почне дебати
-    return await start_debate_with_clients(query, context)
-
-
-async def start_debate_with_clients(update_or_query: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Остаточна підготовка, перевірка лімітів та запуск сесії."""
-    # Отримуємо об'єкт повідомлення для відповіді
-    message = update_or_query.message if hasattr(update_or_query, 'message') else update_or_query
+    ai1_data = next(key for key in keys if key[0] == context.chat_data['ai1_key_id'])
+    ai2_data = next(key for key in keys if key[0] == context.chat_data['ai2_key_id'])
     
-    user_id = message.chat.id
-    topic = context.user_data['debate_topic']
-    
-    alias1 = context.user_data['debate_ai1_alias']
-    alias2 = context.user_data['debate_ai2_alias']
-    
-    try:
-        # 1. Отримання деталей ключів (id, service, encrypted_key)
-        key1_details = DB_MANAGER.get_key_details_by_alias(user_id, alias1)
-        key2_details = DB_MANAGER.get_key_details_by_alias(user_id, alias2)
+    limit_needed = max_rounds
 
-        if not key1_details or not key2_details:
-             await message.reply_text("❌ Помилка: Не вдалося знайти один із вибраних ключів у базі даних.", reply_markup=get_main_menu(user_id))
-             return ConversationHandler.END
-
-        key1_id, service1, encrypted_key1 = key1_details
-        key2_id, service2, encrypted_key2 = key2_details
-        
-        # 2. Перевірка лімітів ПЕРЕД запуском
-        remaining1 = DB_MANAGER.get_remaining_calls(key1_id)
-        remaining2 = DB_MANAGER.get_remaining_calls(key2_id)
-        
-        # Перевірка: чи вистачить запитів хоча б на 1 раунд (мінімум 1 запит на кожного)
-        if (remaining1 is None or remaining1 < 1) or (remaining2 is None or remaining2 < 1):
-            msg = "❌ **Дебати не можуть розпочатися:** У одного з вибраних AI закінчилися запити (потрібно мінімум 1 на кожного). "
-            if remaining1 is not None and remaining1 < 1: msg += f"'{alias1}' = {remaining1} "
-            if remaining2 is not None and remaining2 < 1: msg += f"'{alias2}' = {remaining2}"
-            msg += ". Будь ласка, додайте новий ключ або збільште ліміт."
-            
-            await message.reply_text(msg, parse_mode='Markdown', reply_markup=get_main_menu(user_id))
-            return ConversationHandler.END
-
-        # 3. Дешифрування та ініціалізація клієнтів
-        api_key1 = decrypt_key(encrypted_key1)
-        api_key2 = decrypt_key(encrypted_key2)
-
-        # Ініціалізація клієнтів за допомогою AI_CLIENTS_MAP
-        client1 = AI_CLIENTS_MAP[service1](api_key=api_key1) 
-        client2 = AI_CLIENTS_MAP[service2](api_key=api_key2) 
-        
-        # Зберігаємо імена для відображення
-        ai1_name = f"*{alias1}* ({AVAILABLE_SERVICES[service1]})"
-        ai2_name = f"*{alias2}* ({AVAILABLE_SERVICES[service2]})"
-        
-        clients_map = {ai1_name: client1, ai2_name: client2}
-        key_ids_map = {ai1_name: key1_id, ai2_name: key2_id}
-
-        # 4. Створення сесії (передача key_ids_map)
-        session = DebateSession(
-            topic=topic, 
-            clients_map=clients_map, 
-            key_ids_map=key_ids_map, 
-            max_rounds=context.user_data.get('debate_rounds', 3)
+    # Перевірка лімітів 
+    if ai1_data[5] < limit_needed and ai1_data[4] > 0:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"❌ **Ліміт вичерпано.** AI 1 ({ai1_data[3]}) має лише {ai1_data[5]} запитів, але потрібно {limit_needed}."
         )
+        return ConversationHandler.END
+    if ai2_data[5] < limit_needed and ai2_data[4] > 0:
+         await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"❌ **Ліміт вичерпано.** AI 2 ({ai2_data[3]}) має лише {ai2_data[5]} запитів, але потрібно {limit_needed}."
+        )
+         return ConversationHandler.END
+
+
+    # 2. Створення клієнтів
+    try:
+        clients_map: Dict[str, BaseAI] = {}
+        key_ids_map: Dict[str, int] = {}
         
-        context.user_data['current_debate_session'] = session
+        # AI 1
+        service1, key1, alias1 = ai1_data[1], ai1_data[2], ai1_data[3]
+        model_name1_key = AVAILABLE_MODELS.get(service1, [None])[0]
+        model_name1 = MODEL_NAME_TO_ID.get(model_name1_key)
         
-        initial_message = (
+        AIClientClass1: Type[BaseAI] = AI_CLIENTS_MAP[service1]
+        clients_map[alias1] = AIClientClass1(model_name=model_name1, api_key=key1)
+        key_ids_map[alias1] = ai1_data[0]
+        
+        # AI 2
+        service2, key2, alias2 = ai2_data[1], ai2_data[2], ai2_data[3]
+        model_name2_key = AVAILABLE_MODELS.get(service2, [None])[0]
+        model_name2 = MODEL_NAME_TO_ID.get(model_name2_key)
+        
+        AIClientClass2: Type[BaseAI] = AI_CLIENTS_MAP[service2]
+        clients_map[alias2] = AIClientClass2(model_name=model_name2, api_key=key2)
+        key_ids_map[alias2] = ai2_data[0]
+
+    except Exception as e:
+        logger.error(f"Помилка ініціалізації клієнтів дебатів: {e}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ **Критична помилка ініціалізації AI-клієнтів.** Перевірте, чи встановлені всі необхідні бібліотеки (groq, google-genai, anthropic, httpx)."
+        )
+        return ConversationHandler.END
+
+    # 3. Створення сесії дебатів
+    session = DebateSession(
+        topic=topic,
+        clients_map=clients_map,
+        key_ids_map=key_ids_map,
+        max_rounds=max_rounds
+    )
+    context.chat_data['debate_session'] = session
+    
+    # 4. Повідомлення про початок
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=(
             f"**⚔️ Дебати розпочато!**\n\n"
-            f"**Тема:** {topic}\n"
-            f"**Учасники:** {ai1_name} vs {ai2_name}\n"
-            f"**Раундів:** {session.MAX_ROUNDS}\n"
-            f"**Початкові ліміти:** {alias1}: {remaining1}, {alias2}: {remaining2}\n"
-            f"Натисніть *'Наступний Раунд'* для продовження."
-        )
-        
-        # Відповідаємо на message, якщо це callback, або надсилаємо нове, якщо це команда
-        await message.reply_text(
-            initial_message,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Наступний Раунд", callback_data='run_round')]]),
-            parse_mode='Markdown'
-        )
-        
-        return ConversationHandler.END
-        
-    except Exception as e:
-        logger.error(f"Помилка при запуску дебатів: {e}")
-        await message.reply_text(f"❌ Критична помилка при запуску: {e}", reply_markup=get_main_menu(user_id))
-        return ConversationHandler.END
+            f"**Тема:** _{topic}_\n"
+            f"**Учасники:** {alias1} ({model_name1_key}) проти {alias2} ({model_name2_key})\n"
+            f"**Раундів:** {max_rounds}\n\n"
+            "Натисніть кнопку, щоб почати перший раунд..."
+        ),
+        parse_mode='Markdown'
+    )
+    
+    # Запускаємо перший раунд (відразу після створення)
+    await run_debate_round(update, context)
+
+    # Виходимо з ConversationHandler
+    return ConversationHandler.END
 
 
-async def run_debate_round(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Виконує один раунд дебатів, декрементує ліміти та відображає результат."""
+# --- ЛОГІКА ДЕБАТІВ ---
+
+async def run_debate_round(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробляє наступний раунд дебатів."""
     query = update.callback_query
-    await query.answer(text="Генерую відповіді...")
     
-    session: DebateSession = context.user_data.get('current_debate_session')
+    session: Optional[DebateSession] = context.chat_data.get('debate_session')
     if not session:
-        await query.edit_message_text("❌ Сесія дебатів не знайдена. Почніть нові дебати: /debate", reply_markup=get_main_menu(update.effective_user.id))
-        return ConversationHandler.END
-        
-    # Ключі клієнтів вже з alias та service, тому вони унікальні
-    ai1_name, ai2_name = list(session.clients.keys())
-
-    try:
-        await query.edit_message_text(f"⏳ Раунд {session.round + 1} з {session.MAX_ROUNDS}: {ai1_name} та {ai2_name} думають...", parse_mode='Markdown')
-        
-        # run_next_round: асинхронно отримує відповіді та виконує DB_MANAGER.decrement_calls
-        response1, response2 = await session.run_next_round() 
-        
-        # 1. Форматування відповіді
-        round_text = (
-            f"**--- РАУНД {session.round}/{session.MAX_ROUNDS} ---**\n\n"
-            f"**{ai1_name}:**\n{response1}\n\n"
-            f"**{ai2_name}:**\n{response2}\n"
-        )
-        
-        # Відправляємо нове повідомлення з результатами, оскільки попереднє було "Думають..."
-        await query.message.reply_text(round_text, parse_mode='Markdown')
-
-        # 2. Оновлення інформації про ліміти у відповіді
-        remaining1 = DB_MANAGER.get_remaining_calls(session.key_ids[ai1_name])
-        remaining2 = DB_MANAGER.get_remaining_calls(session.key_ids[ai2_name])
-        
-        status_message = (
-            f"**Ліміти після раунду {session.round}:**\n"
-            f"{ai1_name}: {remaining1} запитів\n"
-            f"{ai2_name}: {remaining2} запитів"
-        )
-        
-        await query.message.reply_text(status_message, parse_mode='Markdown')
-        
-        # 3. Перевірка завершення
-        if session.round >= session.MAX_ROUNDS:
-             final_message = f"✅ **Дебати ЗАВЕРШЕНО!**\n\nТема: {session.topic}\nКількість раундів: {session.MAX_ROUNDS}\n"
-             final_message += "Натисніть /history для перегляду всіх раундів."
-             await query.message.reply_text(final_message, reply_markup=get_main_menu(update.effective_user.id))
-             context.user_data.pop('current_debate_session', None)
-             return ConversationHandler.END
-        
-        # 4. Наступний раунд
-        # Перевірка, чи вистачить лімітів для наступного раунду (потрібно 1 на кожного)
-        if remaining1 < 1 or remaining2 < 1:
-             msg = f"❌ **Дебати зупинено:** У одного з AI закінчилися запити. {ai1_name}: {remaining1}, {ai2_name}: {remaining2}. "
-             await query.message.reply_text(msg, parse_mode='Markdown', reply_markup=get_main_menu(update.effective_user.id))
-             context.user_data.pop('current_debate_session', None)
-             return ConversationHandler.END
-             
-        await query.message.reply_text(
-            f"Дебати тривають. Наступний раунд {session.round + 1} з {session.MAX_ROUNDS}.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Наступний Раунд", callback_data='run_round')]])
-        )
-        
-    except Exception as e:
-        # Обробка помилки вичерпання ліміту або іншої критичної помилки
-        error_msg = str(e)
-        if "Ліміт запитів" in error_msg or "Критична помилка" in error_msg:
-             await query.message.reply_text(f"❌ **Дебати зупинено:** {error_msg}", reply_markup=get_main_menu(update.effective_user.id), parse_mode='Markdown')
+        if query:
+            await query.answer("Помилка: Не знайдено активної сесії дебатів. Спробуйте /debate.")
         else:
-            logger.error(f"Помилка в раунді дебатів: {e}")
-            await query.message.reply_text(f"❌ Сталася помилка в раунді: {e}", reply_markup=get_main_menu(update.effective_user.id))
-        
-        # Очистка сесії
-        context.user_data.pop('current_debate_session', None)
-        return ConversationHandler.END
-
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показує історію поточної сесії."""
-    session: DebateSession = context.user_data.get('current_debate_session')
-    
-    if not session:
-        await update.message.reply_text("❌ Немає активної або щойно завершеної сесії дебатів.")
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="Помилка: Не знайдено активної сесії дебатів. Спробуйте /debate.")
         return
 
-    history = session.get_full_history()
-    
-    response = (
-        f"**📜 Історія Дебатів**\n"
-        f"**Тема:** {session.topic}\n"
-        f"**Завершено раундів:** {session.round}\n\n"
-        f"```\n{history}\n```"
-    )
-    
-    await update.message.reply_text(response, parse_mode='Markdown')
-
-
-# --- 3. ІНШІ КОМАНДИ ---
-
-async def mykeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Відображає ключі користувача."""
-    user_id = update.effective_user.id
-    keys = DB_MANAGER.get_user_keys_with_alias(user_id)
-    
-    if not keys:
-        message = "🔑 У вас немає доданих API ключів.\n\nНатисніть /addkey, щоб додати перший ключ."
-    else:
-        message = "🔑 **Ваші API ключі та ліміти:**\n\n"
-        for alias, service, remaining, key_id in keys:
-            service_name = AVAILABLE_SERVICES.get(service, service.upper())
-            
-            message += f"**• {alias}**\n"
-            message += f"  > Сервіс: `{service_name}`\n"
-            message += f"  > Залишок запитів: **{remaining}**\n\n"
-            
-    await update.message.reply_text(message, parse_mode='Markdown', reply_markup=get_main_menu(user_id))
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Відображає довідку."""
-    help_text = (
-        "🤖 **Довідка по AI Debate Bot:**\n\n"
-        "1. **/addkey** або кнопка `➕ Додати API ключ`:\n"
-        "   - Додайте свій ключ для використання AI-моделей. Це BYOK (Bring Your Own Key).\n"
-        "   - Ви самі встановлюєте **місячний ліміт запитів** для цього ключа.\n"
-        "   - **1 раунд дебатів = 2 запити** (один на AI 1, один на AI 2).\n\n"
-        "2. **/debate** або кнопка `⚔️ Розпочати Дебати`:\n"
-        "   - Оберіть тему, кількість раундів та два AI для участі.\n"
-        "   - Бот автоматично перевіряє **залишок запитів** перед кожним раундом.\n\n"
-        "3. **/mykeys** або кнопка `🔑 Мої Ключі`:\n"
-        "   - Перегляньте список своїх ключів, їхній сервіс та поточний залишок запитів.\n\n"
-        "4. **/history**:\n"
-        "   - Показує повну історію останньої активної або завершеної сесії дебатів.\n\n"
-        "5. **/cancel**:\n"
-        "   - Скасовує поточну розмову (наприклад, додавання ключа) і повертає до головного меню."
-    )
-    await update.message.reply_text(help_text, parse_mode='Markdown', reply_markup=get_main_menu(update.effective_user.id))
-
-# --- ERROR HANDLER ---
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log the error and send a telegram message."""
-    logger.error("Помилка обробки оновлення:", exc_info=context.error)
-    
-    # Try to send a message to the user
-    if update and update.effective_chat:
+    if session.is_running:
+        if query:
+            await query.answer("Зачекайте, AI вже думають над своїми ходами...")
+        return
+        
+    # Якщо це колбек, видаляємо кнопку, щоб уникнути подвійного натискання
+    if query:
+        await query.answer(f"Запускаю раунд {session.round + 1}...")
         try:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="❌ Виникла внутрішня помилка. Будь ласка, спробуйте ще раз або використайте /cancel.",
-            )
-        except Exception as e:
-            logger.error(f"Не вдалося відправити повідомлення про помилку користувачу: {e}")
+            # Змінюємо повідомлення на "Думає..."
+            await query.edit_message_text(
+                f"**Тема:** _{session.topic}_\n"
+                f"**РАУНД {session.round + 1}/{session.MAX_ROUNDS}**\n\n"
+                f"{DebateStatus.THINKING.value}"
+            , parse_mode='Markdown')
+        except error.BadRequest as e:
+            # Якщо повідомлення занадто старе або вже змінено
+            logger.warning(f"Failed to edit message to 'THINKING': {e}")
+            pass
 
-# --- SETUP ---
+    # Основна логіка раунду
+    try:
+        is_finished, result_text = await session.next_round()
+    except Exception as e:
+        logger.error(f"Критична помилка виконання раунду: {e}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"❌ **Критична помилка під час виконання раунду:**\n`{e}`\nДебати зупинено. Спробуйте /debate знову."
+        , parse_mode='Markdown')
+        context.chat_data.pop('debate_session', None)
+        return
+
+    # 4. Відправка результатів
+    
+    # Кнопка для наступного раунду
+    keyboard = []
+    if not is_finished:
+        keyboard.append([InlineKeyboardButton("➡️ Наступний раунд", callback_data='run_round')])
+        final_text = result_text + "\n\n**Натисніть 'Наступний раунд'** для продовження."
+    else:
+        final_text = result_text + "\n\n**🛑 ДЕБАТИ ЗАВЕРШЕНО!**\n\nВикористовуйте /debate для нових дебатів."
+        context.chat_data.pop('debate_session', None)
+        
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Використовуємо `send_message` для коректного відображення довгих відповідей
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=final_text,
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+
+# --- СКИНУТИ РОЗМОВУ ---
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обробляє команду /cancel та завершує будь-яку розмову."""
+    if update.message:
+        try:
+            await update.message.reply_text(
+                '✅ Скасовано. Ви можете почати нову операцію.', 
+                reply_markup=InlineKeyboardMarkup([])
+            )
+        except Exception:
+             pass # Не критично
+    elif update.callback_query:
+        try:
+            await update.callback_query.edit_message_text('✅ Скасовано.')
+        except Exception:
+            pass # Не критично
+        
+    # Скидаємо всі тимчасові дані
+    context.user_data.pop('temp_service', None)
+    context.user_data.pop('temp_api_key', None)
+    context.user_data.pop('temp_alias', None)
+    context.chat_data.pop('debate_session', None)
+    context.chat_data.pop('debate_topic', None)
+    
+    return ConversationHandler.END
+
+
+# --- ЗАГАЛЬНІ НАЛАШТУВАННЯ ---
+
+def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Логує помилки та обробляє типові ситуації."""
+    try:
+        error = context.error
+        error_msg = str(error)
+        error_type = type(error).__name__
+
+        if isinstance(error, error.Conflict) or 'Conflict' in error_type:
+             logger.info("Conflict detected, likely another instance is running.")
+             return
+        
+        logger.error(f"Update {update} caused error {error_type}: {error_msg}")
+        
+        # Відправка повідомлення користувачу про критичну помилку
+        if update and update.effective_chat:
+            if 'Message is not modified' in error_msg or 'Message to edit not found' in error_msg:
+                 # Ігноруємо цю помилку, вона часта при редагуванні
+                 return
+
+            if 'telegram.error' in error_type:
+                 # Типова помилка, яку можна ігнорувати або логувати
+                 logger.info(f"Telegram API error: {error_msg}")
+                 return
+
+            context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"❌ **Виникла непередбачувана помилка!**\nСпробуйте команду ще раз або зверніться до розробника. Деталі: `{error_type}`"
+            , parse_mode='Markdown')
+
+    except Exception as e:
+        logger.critical(f"Помилка в обробнику помилок: {e}")
+
 
 def main_bot_setup(token: str) -> Application:
-    """Налаштування Application та додавання хендлерів."""
-    
+    """Створює та налаштовує об'єкт Application."""
+    if not token:
+        raise ValueError("Token is not set.")
+        
     application = Application.builder().token(token).build()
-    
-    # Conversation: Add Key
+
+    # --- Хендлери для /addkey (FSM) ---
     conv_addkey = ConversationHandler(
-        entry_points=[CommandHandler('addkey', addkey_start), CallbackQueryHandler(addkey_start, pattern='^cmd_addkey')],
+        entry_points=[CommandHandler('addkey', addkey_command)],
         states={
-            AWAITING_SERVICE: [CallbackQueryHandler(addkey_service_chosen, pattern='^srv_')],
-            AWAITING_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, addkey_receive_key)],
-            AWAITING_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, addkey_receive_limit)], 
-            AWAITING_ALIAS: [MessageHandler(filters.TEXT & ~filters.COMMAND, addkey_receive_alias)],
+            AWAITING_SERVICE: [CallbackQueryHandler(receive_service_choice, pattern='^service_')],
+            AWAITING_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_key_input)],
+            AWAITING_ALIAS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_alias_input)],
+            AWAITING_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_limit_input)],
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
-
-    # Conversation: Debate
+    
+    # --- Хендлери для /debate (FSM) ---
     conv_debate = ConversationHandler(
-        entry_points=[CommandHandler('debate', debate_start), CallbackQueryHandler(debate_start, pattern='^cmd_debate')],
+        entry_points=[CommandHandler('debate', debate_command)],
         states={
             AWAITING_DEBATE_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, debate_topic_received)],
             AWAITING_DEBATE_ROUNDS: [CallbackQueryHandler(debate_rounds_chosen, pattern='^rounds_')],
@@ -658,6 +696,9 @@ def main_bot_setup(token: str) -> Application:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("mykeys", mykeys_command))
     application.add_handler(CommandHandler("history", history_command))
+    
+    # Хендлери для видалення ключа
+    application.add_handler(CallbackQueryHandler(delete_key_handler, pattern='^deletekey_'))
     
     # Хендлери для розмов
     application.add_handler(conv_addkey)
@@ -677,10 +718,31 @@ def main() -> None:
     application = main_bot_setup(TELEGRAM_BOT_TOKEN)
     application.add_error_handler(error_handler)
     
-    logger.info("Бот запущено у режимі Polling...")
-    application.run_polling(poll_interval=1.0)
+    # Виводимо інформацію про інстанцію
+    instance_id = f"{socket.gethostname()}_{os.getpid()}_{int(time.time() * 1000) % 10000}"
+    print(f"Бот запущено у режимі Polling...")
+    print(f"Instance ID: {instance_id}")
+
+    try:
+        application.run_polling(poll_interval=1.0, timeout=10.0, close_loop=False)
+    except error.Conflict as e:
+        logger.error(f"Критична помилка: Конфлікт інстанцій. Переконайтеся, що не запущено Webhook та лише один процес Polling: {e}")
+    except Exception as e:
+        logger.critical(f"Критична помилка запуску бота: {e}")
+        # Логуємо трасбек для критичних помилок
+        import traceback
+        traceback.print_exc()
 
 if __name__ == '__main__':
-    # Переконуємось, що ініціалізація DB відбувається до запуску.
-    # DB_MANAGER створюється під час імпорту database.py.
+    # Оскільки тут використовується sys, socket та інші системні речі, 
+    # це має бути запущено з кореневої директорії проекту, де є src/
+    
+    # Додамо перевірку для локального запуску
+    if not os.path.exists('./src') and not os.path.exists('./src/bot.py'):
+        print("Попередження: Схоже, ви запускаєте файл не з кореневої папки проекту, переконайтеся, що модулі імпортуються коректно.")
+    
+    # Встановлюємо шлях, щоб уникнути помилок імпорту
+    if os.path.isdir('./src') and './src' not in sys.path:
+        sys.path.insert(0, './src')
+        
     main()
